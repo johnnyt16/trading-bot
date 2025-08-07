@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 venv/
+venv_old/
 env/
 ENV/
 
@@ -42,6 +43,11 @@ Thumbs.db
 htmlcov/
 .tox/
 .hypothesis/
+
+# Temporary files
+requirements_backup.txt
+upgrade_python.sh
+test_all_apis.py
 
 # Distribution
 dist/
