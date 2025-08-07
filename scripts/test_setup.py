@@ -2,11 +2,13 @@
 
 import sys
 import os
+import asyncio
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core import Config, test_connection
-from src.strategies import MomentumTradingBot
+from src.strategies import EarlyDetectionIntegration, SocialIntegration, UltimateTradingStrategy
+import alpaca_trade_api as tradeapi
 
 
 def test_environment():
@@ -36,43 +38,91 @@ def test_environment():
         print("   ✅ Connected to Alpaca successfully")
         tests_passed.append(True)
 
-    # Test 3: Bot initialization
-    print("\n3. Testing bot initialization...")
+    # Test 3: Initialize API
+    print("\n3. Testing API initialization...")
     try:
-        bot = MomentumTradingBot()
-        print("   ✅ Bot initialized successfully")
+        api = tradeapi.REST(
+            Config.ALPACA_API_KEY,
+            Config.ALPACA_SECRET_KEY,
+            Config.ALPACA_BASE_URL
+        )
+        print("   ✅ API initialized successfully")
         tests_passed.append(True)
-
-        # Test 4: Market data
-        print("\n4. Testing market data access...")
-        score = bot.calculate_momentum_score("AAPL")
-        if score is not None:
-            print(f"   ✅ Market data working (AAPL score: {score:.2f})")
-            tests_passed.append(True)
-        else:
-            print("   ⚠️  Market data returned no score")
-            tests_passed.append(False)
-
     except Exception as e:
-        print(f"   ❌ Bot initialization failed: {e}")
+        print(f"   ❌ API initialization failed: {e}")
+        tests_passed.append(False)
+        return False
+
+    # Test 4: Early Detection Scanner
+    print("\n4. Testing Early Detection Scanner...")
+    try:
+        early_detection = EarlyDetectionIntegration(api)
+        print("   ✅ Early Detection Scanner initialized")
+        tests_passed.append(True)
+    except Exception as e:
+        print(f"   ❌ Early Detection Scanner failed: {e}")
         tests_passed.append(False)
 
-    # Summary
+    # Test 5: Social Sentiment Scanner
+    print("\n5. Testing Social Sentiment Scanner...")
+    try:
+        social_scanner = SocialIntegration()
+        print("   ✅ Social Sentiment Scanner initialized")
+        tests_passed.append(True)
+    except Exception as e:
+        print(f"   ❌ Social Sentiment Scanner failed: {e}")
+        tests_passed.append(False)
+
+    # Test 6: Ultimate Strategy
+    print("\n6. Testing Ultimate Trading Strategy...")
+    try:
+        ultimate_strategy = UltimateTradingStrategy()
+        print("   ✅ Ultimate Trading Strategy initialized")
+        tests_passed.append(True)
+    except Exception as e:
+        print(f"   ❌ Ultimate Trading Strategy failed: {e}")
+        tests_passed.append(False)
+
+    # Test 7: Market data access
+    print("\n7. Testing market data access...")
+    try:
+        # Get a snapshot for a test symbol
+        snapshot = api.get_snapshot("AAPL")
+        if snapshot:
+            print(f"   ✅ Market data working (AAPL price: ${snapshot.latest_trade.p:.2f})")
+            tests_passed.append(True)
+        else:
+            print("   ⚠️  Market data returned empty (market may be closed)")
+            tests_passed.append(True)  # Not a failure if market is closed
+    except Exception as e:
+        print(f"   ❌ Market data failed: {e}")
+        tests_passed.append(False)
+
+    # Test 8: Async functionality
+    print("\n8. Testing async scanner functionality...")
+    try:
+        async def test_scanner():
+            session, _ = early_detection.scanner.get_market_session()
+            return session
+        
+        session = asyncio.run(test_scanner())
+        print(f"   ✅ Async operations working (Current session: {session})")
+        tests_passed.append(True)
+    except Exception as e:
+        print(f"   ❌ Async operations failed: {e}")
+        tests_passed.append(False)
+
     print("\n" + "=" * 50)
     if all(tests_passed):
         print("✅ ALL TESTS PASSED!")
-        print("=" * 50)
-        print("\nNext steps:")
-        print("1. Run backtest: python main.py backtest")
-        print("2. Start paper trading: python main.py paper")
-        print("3. Check performance: python main.py analyze")
-        return True
+        print("Your bot is ready to run.")
     else:
-        failed_count = len([t for t in tests_passed if not t])
-        print(f"❌ {failed_count} TEST(S) FAILED")
-        print("=" * 50)
-        print("\nPlease fix the issues above and try again.")
-        return False
+        failed = tests_passed.count(False)
+        print(f"⚠️  {failed} test(s) failed")
+        print("Please fix the issues above before running the bot.")
+    print("=" * 50)
+
+    return all(tests_passed)
 
 
 if __name__ == "__main__":

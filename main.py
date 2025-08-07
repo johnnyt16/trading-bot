@@ -10,9 +10,12 @@ from loguru import logger
 from datetime import datetime
 import time
 
-from src.core import Config, test_connection, DatabaseManager, RiskManager
-from src.strategies import MomentumTradingBot
+from src.core import Config, test_connection, DatabaseManager, RiskManager, OptimalTradingSchedule
+from src.strategies import EarlyDetectionIntegration, SocialIntegration, UltimateTradingStrategy
 from src.utils import AlertSystem, Backtester
+import alpaca_trade_api as tradeapi
+import asyncio
+import os
 
 def setup_logging(log_level="INFO"):
     logger.remove()
@@ -45,10 +48,25 @@ def run_paper_trading():
     
     alert_system.send_system_status("online", "Trading bot started in paper mode")
     
-    bot = MomentumTradingBot()
+    # Initialize API
+    api = tradeapi.REST(
+        os.getenv('ALPACA_API_KEY'),
+        os.getenv('ALPACA_SECRET_KEY'),
+        Config.ALPACA_BASE_URL
+    )
+    
+    # Initialize new modules
+    early_detection = EarlyDetectionIntegration(api)
+    social_scanner = SocialIntegration()
+    ultimate_strategy = UltimateTradingStrategy()
+    schedule = OptimalTradingSchedule()
     
     try:
-        bot.run()
+        # Main trading loop
+        asyncio.run(run_trading_loop(
+            api, early_detection, social_scanner, 
+            ultimate_strategy, schedule, alert_system
+        ))
     except KeyboardInterrupt:
         logger.info("Trading bot stopped by user")
         alert_system.send_system_status("offline", "Trading bot stopped by user")
@@ -80,10 +98,25 @@ def run_live_trading():
     
     alert_system.send_system_status("online", "⚠️ LIVE TRADING STARTED - REAL MONEY ⚠️")
     
-    bot = MomentumTradingBot()
+    # Initialize API
+    api = tradeapi.REST(
+        os.getenv('ALPACA_API_KEY'),
+        os.getenv('ALPACA_SECRET_KEY'),
+        Config.ALPACA_BASE_URL
+    )
+    
+    # Initialize new modules
+    early_detection = EarlyDetectionIntegration(api)
+    social_scanner = SocialIntegration()
+    ultimate_strategy = UltimateTradingStrategy()
+    schedule = OptimalTradingSchedule()
     
     try:
-        bot.run()
+        # Main trading loop
+        asyncio.run(run_trading_loop(
+            api, early_detection, social_scanner, 
+            ultimate_strategy, schedule, alert_system
+        ))
     except KeyboardInterrupt:
         logger.info("Trading bot stopped by user")
         alert_system.send_system_status("offline", "Live trading stopped by user")
@@ -104,6 +137,60 @@ def test_setup():
     else:
         logger.error("Setup test failed. Please fix the issues above.")
         return False
+
+async def run_trading_loop(api, early_detection, social_scanner, 
+                           ultimate_strategy, schedule, alert_system):
+    """
+    Main trading loop integrating all strategies
+    """
+    logger.info("Starting integrated trading loop")
+    
+    while True:
+        try:
+            # Get current trading session
+            current_session = schedule.get_current_session()
+            scan_strategy = schedule.get_scan_strategy()
+            
+            logger.info(f"Current session: {current_session}")
+            
+            if current_session == 'market_closed':
+                logger.info("Market closed, waiting...")
+                await asyncio.sleep(300)  # Wait 5 minutes
+                continue
+            
+            # Get early detection signals
+            early_opportunities = await early_detection.scanner.get_priority_trades()
+            
+            # Process opportunities
+            for opp in early_opportunities:
+                # Check if we should enter
+                if await early_detection.should_enter_position(opp['symbol'], opp):
+                    # Enhance with social signals
+                    social_data = social_scanner.enhance_signal_with_social(
+                        opp['symbol'], 
+                        opp.get('opportunity_score', 0)
+                    )
+                    
+                    # Calculate position size
+                    position_size = await early_detection.get_position_size(opp)
+                    
+                    logger.info(f"Signal for {opp['symbol']}: "
+                              f"Score={social_data['final_score']}, "
+                              f"Size={position_size:.2%}")
+                    
+                    # Here you would execute the trade
+                    # For now, just log it
+                    alert_system.send_trade_alert(
+                        f"BUY SIGNAL: {opp['symbol']} at ${opp['current_price']:.2f}"
+                    )
+            
+            # Wait based on scan frequency
+            wait_time = scan_strategy.get('scan_frequency', 15) * 60
+            await asyncio.sleep(wait_time)
+            
+        except Exception as e:
+            logger.error(f"Error in trading loop: {e}")
+            await asyncio.sleep(60)  # Wait 1 minute on error
 
 def analyze_performance():
     logger.info("Analyzing trading performance...")
