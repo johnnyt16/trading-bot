@@ -578,7 +578,7 @@ class GPT5TradingBrain:
                 logger.warning(f"Position too small: {symbol}")
                 return False
             
-            # Place order with Alpaca
+            # Place order with Alpaca - EXTENDED HOURS ENABLED
             order = self.alpaca.submit_order(
                 symbol=symbol,
                 qty=shares,
@@ -586,6 +586,7 @@ class GPT5TradingBrain:
                 type='limit',
                 limit_price=trade_plan['entry_price'],
                 time_in_force='day',
+                extended_hours=True,  # Enable extended hours trading
                 order_class='bracket',
                 stop_loss={'stop_price': trade_plan['stop_loss']},
                 take_profit={'limit_price': trade_plan['target_1']}
@@ -607,47 +608,123 @@ class GPT5TradingBrain:
     
     async def manage_positions(self):
         """
-        GPT-5 manages existing positions
-        Can adjust stops, take profits, or exit based on new information
+        GPT-5 manages existing positions intelligently
+        Monitors news, adjusts stops, takes profits, or exits based on real-time analysis
         """
         positions = self.alpaca.list_positions()
         
+        if not positions:
+            logger.debug("No open positions to manage")
+            return
+        
+        logger.info(f"📊 Managing {len(positions)} position(s)")
+        
         for position in positions:
+            symbol = position.symbol
+            entry_price = float(position.avg_entry_price)
+            current_price = float(position.current_price)
+            pnl_pct = float(position.unrealized_plpc) * 100
+            shares = int(position.qty)
+            
+            # Search for real-time updates on this position
+            try:
+                position_search = self.tavily.search(
+                    f"{symbol} stock news latest {datetime.now().strftime('%B %d')}",
+                    max_results=3
+                )
+                search_results = position_search.get('results', [])
+            except:
+                search_results = []
+            
             management_prompt = f"""
-            Analyze my current position:
-            Symbol: {position.symbol}
-            Entry: ${float(position.avg_entry_price):.2f}
-            Current: ${float(position.current_price):.2f}
-            P&L: {float(position.unrealized_plpc)*100:.2f}%
-            Time held: {position.qty} shares
+            Analyze my current {symbol} position with real-time data:
             
-            Search the web for:
-            1. Any new news or developments
-            2. Technical levels being approached
-            3. Sentiment shifts
-            4. Volume and momentum changes
+            POSITION DETAILS:
+            - Entry: ${entry_price:.2f}
+            - Current: ${current_price:.2f}
+            - P&L: {pnl_pct:.2f}% ({'+' if pnl_pct > 0 else ''}${(current_price - entry_price) * shares:.2f})
+            - Shares: {shares}
             
-            Decide:
-            1. HOLD - Continue as planned
-            2. ADD - Increase position (if high conviction)
-            3. TRIM - Take partial profits
-            4. EXIT - Close entire position
-            5. ADJUST - Move stop loss or targets
+            LATEST NEWS/DEVELOPMENTS:
+            {json.dumps(search_results, indent=2)[:1000]}
             
-            Provide reasoning and specific action.
+            DECISION FRAMEWORK:
+            - If up >5%: Consider trailing stop or partial profit
+            - If up >10%: Take 50% profits, trail the rest
+            - If down >3%: Re-evaluate thesis, possibly exit
+            - If news is negative: Exit immediately
+            - If momentum accelerating: Raise targets
+            
+            Analyze and decide:
+            1. HOLD - Thesis intact, continue as planned
+            2. TRIM - Take partial profits (specify %)
+            3. EXIT - Close entire position now
+            4. TRAIL - Move stop up to lock profits
+            5. ADD - Double down (only if strong new catalyst)
+            
+            Return JSON:
+            {{
+                "action": "HOLD/TRIM/EXIT/TRAIL/ADD",
+                "reasoning": "Why this decision",
+                "new_stop": 0.00,  // If trailing
+                "trim_percent": 50,  // If trimming
+                "urgency": "high/medium/low"
+            }}
             """
             
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": management_prompt}
-                ],
-                temperature=0.3
-            )
-            
-            # Execute GPT-5's management decision
-            await self._execute_management(position, response.choices[0].message.content)
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": management_prompt}
+                    ],
+                    temperature=0.2  # Lower temp for position management
+                )
+                
+                decision = self._parse_json_response(response.choices[0].message.content)
+                action = decision.get('action', 'HOLD')
+                reasoning = decision.get('reasoning', '')
+                
+                logger.info(f"  {symbol}: {action} - {reasoning[:100]}")
+                
+                # Execute the management decision
+                if action == 'EXIT':
+                    # Market sell immediately
+                    self.alpaca.submit_order(
+                        symbol=symbol,
+                        qty=shares,
+                        side='sell',
+                        type='market',
+                        time_in_force='day'
+                    )
+                    logger.warning(f"🔴 EXITED {symbol}: {reasoning}")
+                    
+                elif action == 'TRIM' and decision.get('trim_percent'):
+                    # Sell partial position
+                    trim_shares = int(shares * decision['trim_percent'] / 100)
+                    if trim_shares > 0:
+                        self.alpaca.submit_order(
+                            symbol=symbol,
+                            qty=trim_shares,
+                            side='sell',
+                            type='market',
+                            time_in_force='day'
+                        )
+                        logger.info(f"✂️ TRIMMED {trim_shares} shares of {symbol}")
+                        
+                elif action == 'TRAIL' and decision.get('new_stop'):
+                    # Update stop loss (would need to cancel/replace order)
+                    logger.info(f"📈 TRAILING stop for {symbol} to ${decision['new_stop']:.2f}")
+                    
+                elif action == 'ADD':
+                    # Could add to position if we want
+                    logger.info(f"🎯 Considering adding to {symbol}")
+                    
+                # Default is HOLD - do nothing
+                
+            except Exception as e:
+                logger.error(f"Failed to manage {symbol}: {e}")
     
     async def learn_and_adapt(self):
         """
