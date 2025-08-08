@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import alpaca_trade_api as tradeapi
+import os
 from loguru import logger
 import pandas as pd
 from dataclasses import dataclass
@@ -38,14 +39,21 @@ class PositionManager:
         # Track position targets
         self.position_targets = {}
         
-        # Exit strategy parameters
+        # Exit strategy parameters (configurable via env)
+        stop_loss_pct = float(os.getenv('STOP_LOSS_PERCENT', 0.03))
+        take_profit_1_pct = float(os.getenv('TAKE_PROFIT_PERCENT', 0.05))
+        take_profit_2_pct = float(os.getenv('TAKE_PROFIT_2_PERCENT', 0.10))
+        take_profit_3_pct = float(os.getenv('TAKE_PROFIT_3_PERCENT', 0.15))
+        trailing_stop_pct = float(os.getenv('TRAILING_STOP_PERCENT', 0.02))
+        time_stop_minutes = int(float(os.getenv('TIME_STOP_MINUTES', 180)))
+
         self.exit_config = {
-            'stop_loss_pct': 0.03,          # 3% stop loss default
-            'take_profit_1_pct': 0.05,      # First target 5%
-            'take_profit_2_pct': 0.10,      # Second target 10%
-            'take_profit_3_pct': 0.15,      # Final target 15%
-            'trailing_stop_pct': 0.02,      # Trail by 2% from highs
-            'time_stop_minutes': 180,       # Exit after 3 hours if flat
+            'stop_loss_pct': stop_loss_pct,
+            'take_profit_1_pct': take_profit_1_pct,
+            'take_profit_2_pct': take_profit_2_pct,
+            'take_profit_3_pct': take_profit_3_pct,
+            'trailing_stop_pct': trailing_stop_pct,
+            'time_stop_minutes': time_stop_minutes,
         }
         
         # Track entry times for time stops

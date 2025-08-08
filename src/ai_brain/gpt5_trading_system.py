@@ -28,21 +28,23 @@ class GPT5TradingBrain:
     """
     
     def __init__(self):
-        # Initialize OpenAI with GPT-5
+        # Initialize OpenAI client
         self.client = AsyncOpenAI(
             api_key=os.getenv('OPENAI_API_KEY')
         )
-        
+
         # Model hierarchy - will try in order if rate limited
         self.model_hierarchy = [
-            "gpt-5",            # GPT-5 (when available - will fallback if not)
+            "gpt-5",            # GPT-5 (may not be available)
             "gpt-4o",           # Best current model
             "gpt-4-turbo",      # Fallback to GPT-4 Turbo
             "gpt-4",            # Standard GPT-4
             "gpt-3.5-turbo",    # Cheaper fallback
             "gpt-4o-mini"       # Free/cheapest option
         ]
-        self.current_model_index = 0
+
+        # Start with an available model to avoid first-call 404s; upgrade later if possible
+        self.current_model_index = 1
         self.model = self.model_hierarchy[self.current_model_index]
         
         # Track rate limit issues
@@ -56,16 +58,37 @@ class GPT5TradingBrain:
         self.alpaca = tradeapi.REST(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY'),
-            os.getenv('ALPACA_BASE_URL')
+            os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
         )
         
         # Risk parameters (AI can override within limits)
         self.risk_limits = {
             'max_position_pct': 0.20,    # 20% max per position
             'max_daily_loss_pct': 0.15,  # 15% daily loss limit
-            'max_positions': 10,          # 10 concurrent positions
-            'min_confidence': 0.60        # 60% minimum AI confidence
+            'max_positions': 10,         # 10 concurrent positions
+            'min_confidence': 60         # Minimum AI confidence as integer percent
         }
+
+        # Optional environment overrides for risk configuration
+        try:
+            max_pos_env = os.getenv('MAX_POSITION_SIZE')
+            if max_pos_env is not None:
+                self.risk_limits['max_position_pct'] = float(max_pos_env)
+
+            max_daily_env = os.getenv('MAX_DAILY_LOSS_PERCENT')
+            if max_daily_env is not None:
+                # Accept 0-1 (e.g., 0.15) or 0-100 (e.g., 15) → always store as 0-1
+                val = float(max_daily_env)
+                self.risk_limits['max_daily_loss_pct'] = val / 100.0 if val > 1 else val
+
+            min_conf_env = os.getenv('MIN_CONFIDENCE_SCORE')
+            if min_conf_env is not None:
+                # Accept 0-1 or 0-100 → store as integer percent
+                val = float(min_conf_env)
+                self.risk_limits['min_confidence'] = int(val * 100) if val <= 1 else int(val)
+        except Exception as _:
+            # If parsing fails, keep defaults
+            pass
         
         # Track AI's performance and learning
         self.ai_memory = []
@@ -156,7 +179,7 @@ class GPT5TradingBrain:
         - Market Status: {market_data['market_status']}
         - Mode: {mode_context}
         - SPY Change: {market_data['spy_change']}%
-        - VIX Level: {market_data['vix_level']} ({"high volatility" if market_data['vix_level'] > 30 else "normal"})
+         - VIX Proxy (VIX index if available, else VIXY ETF): {market_data['vix_level']}
         
         {"Focus on TOMORROW's catalysts and overnight developments:" if research_mode else "Find IMMEDIATE trading opportunities:"}
         
@@ -716,13 +739,12 @@ class GPT5TradingBrain:
             """
             
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
+                response = await self._make_gpt_request(
                     messages=[
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": management_prompt}
                     ],
-                    temperature=0.2  # Lower temp for position management
+                    temperature=0.2
                 )
                 
                 decision = self._parse_json_response(response.choices[0].message.content)
@@ -799,8 +821,7 @@ class GPT5TradingBrain:
         Update trading rules for tomorrow.
         """
         
-        response = await self.client.chat.completions.create(
-            model=self.model,
+        response = await self._make_gpt_request(
             messages=[
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": learning_prompt}
@@ -821,6 +842,7 @@ class GPT5TradingBrain:
         """Get current market conditions using best available data source"""
         spy_change = 0.0
         vix_level = 20.0
+        data_source = 'default'
         clock = None
         
         try:
@@ -840,19 +862,29 @@ class GPT5TradingBrain:
                     spy_change = ((spy_daily_bar.close - spy_daily_bar.open) / 
                                  spy_daily_bar.open * 100)
                     logger.debug(f"SPY change from Alpaca: {spy_change:.2f}%")
+                    data_source = 'alpaca'
             else:
                 # After hours, get last close
                 spy_bars = self.alpaca.get_bars('SPY', '1Day', limit=1, feed='iex').df
                 if not spy_bars.empty:
                     spy_change = 0.0  # No intraday change after hours
+                    data_source = 'alpaca'
                     
             # Get volatility indicator (VIXY as VIX proxy)
+            # Attempt to use ^VIX index from yfinance; fallback to VIXY ETF via Alpaca
             try:
-                vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
-                if vixy_snapshot and vixy_snapshot.latest_trade:
-                    vix_level = vixy_snapshot.latest_trade.price
-            except:
-                vix_level = 20.0  # Average VIX level
+                vix = yf.Ticker('^VIX')
+                vix_hist = vix.history(period='1d')
+                if not vix_hist.empty:
+                    vix_level = float(vix_hist['Close'].iloc[-1])
+                    logger.debug(f"VIX level from yfinance: {vix_level:.2f}")
+            except Exception:
+                try:
+                    vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
+                    if vixy_snapshot and vixy_snapshot.latest_trade:
+                        vix_level = float(vixy_snapshot.latest_trade.price)
+                except Exception:
+                    vix_level = 20.0
                 
         except Exception as e:
             logger.warning(f"Alpaca data fetch failed: {e}")
@@ -865,6 +897,7 @@ class GPT5TradingBrain:
                     spy_change = ((spy_hist['Close'].iloc[-1] - spy_hist['Open'].iloc[0]) / 
                                  spy_hist['Open'].iloc[0] * 100)
                     logger.debug(f"SPY change from yfinance backup: {spy_change:.2f}%")
+                    data_source = 'yfinance'
             except:
                 logger.warning("Both data sources failed, using defaults")
         
@@ -872,7 +905,7 @@ class GPT5TradingBrain:
             'market_status': 'open' if clock and clock.is_open else 'closed',
             'spy_change': round(spy_change, 2),
             'vix_level': round(vix_level, 2),
-            'data_source': 'alpaca' if spy_change != 0.0 else 'default'
+            'data_source': data_source
         }
     
     async def _get_current_data(self, symbol: str) -> Dict:
@@ -1075,7 +1108,7 @@ class GPT5TradingBrain:
         if trade_plan.get('position_size_pct', 0) > self.risk_limits['max_position_pct']:
             return False
         
-        # Check confidence
+        # Check confidence (trade_plan confidence is integer percent)
         if trade_plan.get('confidence', 0) < self.risk_limits['min_confidence']:
             return False
         
@@ -1083,6 +1116,22 @@ class GPT5TradingBrain:
         positions = self.alpaca.list_positions()
         if len(positions) >= self.risk_limits['max_positions']:
             return False
+
+        # Check daily loss limit (block new trades if hit)
+        try:
+            account = self.alpaca.get_account()
+            equity = float(account.equity)
+            last_equity = float(account.last_equity)
+            if last_equity > 0:
+                drawdown = (equity - last_equity) / last_equity
+                if drawdown < -self.risk_limits['max_daily_loss_pct']:
+                    logger.warning(
+                        f"Daily loss limit hit: {drawdown*100:.1f}% < -{self.risk_limits['max_daily_loss_pct']*100:.1f}%"
+                    )
+                    return False
+        except Exception:
+            # If we can't fetch, do not block by default
+            pass
         
         return True
     

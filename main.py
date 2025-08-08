@@ -12,6 +12,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from src.ai_brain.gpt5_trading_system import GPT5TradingBrain
 from src.ai_brain.overnight_researcher import OvernightResearcher
+from src.core.position_manager import PositionManager
 from loguru import logger
 
 async def main():
@@ -23,6 +24,8 @@ async def main():
         logger.info("Initializing GPT-5 Trading System...")
         brain = GPT5TradingBrain()
         overnight_researcher = OvernightResearcher(brain)
+        position_manager = PositionManager(api=brain.alpaca)
+        monitor_task = asyncio.create_task(position_manager.monitor_positions())
         
         logger.info("🚀 GPT-5 Autonomous Trading Started")
         logger.info("Target: $1,000 → $10,000")
@@ -36,7 +39,7 @@ async def main():
             clock = brain.alpaca.get_clock()
             # Use Eastern timezone for consistency with market hours
             eastern = pytz.timezone('US/Eastern')
-            current_time = datetime.now(eastern)
+            current_time = datetime.now(pytz.utc).astimezone(eastern)
             current_hour = current_time.hour
             
             # Extended hours: 4 AM - 9:30 AM and 4 PM - 8 PM ET
@@ -45,8 +48,17 @@ async def main():
             is_extended = is_premarket or is_afterhours
             
             if not clock.is_open and not is_extended:
-                next_open = clock.next_open.strftime('%Y-%m-%d %H:%M:%S ET')
-                hours_until_open = (clock.next_open - current_time).total_seconds() / 3600
+                # Align timezones for subtraction and display
+                next_open_dt = clock.next_open
+                try:
+                    # If tz-naive, assume UTC per Alpaca API
+                    if next_open_dt.tzinfo is None:
+                        next_open_dt = pytz.utc.localize(next_open_dt)
+                except Exception:
+                    pass
+                next_open_et = next_open_dt.astimezone(eastern)
+                next_open = next_open_et.strftime('%Y-%m-%d %H:%M:%S ET')
+                hours_until_open = (next_open_dt - datetime.now(pytz.utc)).total_seconds() / 3600
                 logger.info(f"Market closed. Opens in {hours_until_open:.1f} hours at {next_open}")
                 
                 # OVERNIGHT RESEARCH MODE - Build watchlist of 6 high-confidence stocks
@@ -94,7 +106,15 @@ async def main():
                         analysis = await brain.deep_analysis(opp['symbol'])
                         
                         if analysis['decision'] == 'GO':
-                            await brain.execute_trade(analysis)
+                            executed = await brain.execute_trade(analysis)
+                            if executed:
+                                position_manager.add_position(
+                                    symbol=analysis['symbol'],
+                                    entry_price=analysis['entry_price'],
+                                    stop_loss=analysis['stop_loss'],
+                                    take_profit=analysis['target_1'],
+                                    strategy_type='standard'
+                                )
                             morning_trades_executed = True
                     
                     # Clear watchlist after execution
@@ -114,7 +134,15 @@ async def main():
                     for opp in top_opportunities:
                         analysis = await brain.deep_analysis(opp['symbol'])
                         if analysis['decision'] == 'GO':
-                            await brain.execute_trade(analysis)
+                            executed = await brain.execute_trade(analysis)
+                            if executed:
+                                position_manager.add_position(
+                                    symbol=analysis['symbol'],
+                                    entry_price=analysis['entry_price'],
+                                    stop_loss=analysis['stop_loss'],
+                                    take_profit=analysis['target_1'],
+                                    strategy_type='standard'
+                                )
                             morning_trades_executed = True
                     
                     overnight_researcher.clear_watchlist()
@@ -128,10 +156,17 @@ async def main():
                 analysis = await brain.deep_analysis(opp['symbol'])
                 
                 if analysis['decision'] == 'GO':
-                    await brain.execute_trade(analysis)
+                    executed = await brain.execute_trade(analysis)
+                    if executed:
+                        position_manager.add_position(
+                            symbol=analysis['symbol'],
+                            entry_price=analysis['entry_price'],
+                            stop_loss=analysis['stop_loss'],
+                            take_profit=analysis['target_1'],
+                            strategy_type='standard'
+                        )
             
-            # Manage positions
-            await brain.manage_positions()
+            # Position management handled by PositionManager monitor task
             
             # Learn (every hour)
             if current_time.minute == 0:
@@ -142,6 +177,10 @@ async def main():
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+        try:
+            monitor_task.cancel()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Fatal error: {e}")
 

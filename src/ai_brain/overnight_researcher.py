@@ -193,8 +193,7 @@ class OvernightResearcher:
                 )
                 
                 # Get GPT's updated analysis
-                response = await self.brain.client.chat.completions.create(
-                    model=self.brain.model,
+                response = await self.brain._make_gpt_request(
                     messages=[
                         {"role": "system", "content": self.brain.system_prompt},
                         {"role": "user", "content": research_prompt + f"\n\nLatest info: {json.dumps(latest_search.get('results', [])[:2])}"}
@@ -351,7 +350,11 @@ class OvernightResearcher:
         """
         Get the top N opportunities from watchlist
         """
-        return self.watchlist[:count]
+        if not self.watchlist:
+            return []
+        # Ensure highest-confidence first
+        sorted_list = sorted(self.watchlist, key=lambda x: x.get('confidence', 0), reverse=True)
+        return sorted_list[:count]
     
     def reset_for_new_day(self):
         """

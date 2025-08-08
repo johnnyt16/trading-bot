@@ -5,6 +5,7 @@ A Python trading bot that uses momentum strategies to trade stocks automatically
 ## Quick Start
 
 ### 1. Setup
+
 ```bash
 # Install dependencies
 python -m venv venv
@@ -12,21 +13,35 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Configure API keys
-cp .env.example .env
-# Edit .env with your Alpaca API keys
+# Create .env and edit with your keys
+cat > .env << 'EOF'
+OPENAI_API_KEY=sk-...
+TAVILY_API_KEY=tvly-...
+ALPACA_API_KEY=PK...
+ALPACA_SECRET_KEY=...
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+MAX_POSITION_SIZE=0.05
+STOP_LOSS_PERCENT=0.03
+TAKE_PROFIT_PERCENT=0.05
+MIN_CONFIDENCE_SCORE=0.6
+DATABASE_URL=sqlite:///trading_bot.db
+EOF
 ```
 
 ### 2. Test Connection
+
 ```bash
 python main.py test
 ```
 
 ### 3. Run Backtest
+
 ```bash
 python main.py backtest
 ```
 
 ### 4. Start Paper Trading
+
 ```bash
 python main.py paper
 ```
@@ -41,11 +56,7 @@ python main.py paper
 
 ## Documentation
 
-- 📁 [Project Structure](docs/PROJECT_STRUCTURE.md) - How the code is organized
-- 🚀 [Deployment Guide](docs/DEPLOYMENT.md) - Deploy to DigitalOcean for 24/7 operation
-- 📊 [Trading Strategy](docs/STRATEGY.md) - How the momentum strategy works
-- 🔧 [Configuration](docs/CONFIGURATION.md) - Settings and parameters
-
+- Project docs are coming soon. For now, see the codebase and comments.
 
 ## Project Status
 
@@ -55,12 +66,12 @@ python main.py paper
 
 ## Command Reference
 
-| Command | Description |
-|---------|-------------|
-| `python main.py test` | Test Alpaca connection |
-| `python main.py backtest` | Run historical backtest |
-| `python main.py paper` | Start paper trading |
-| `python main.py analyze` | Show performance metrics |
+| Command                   | Description              |
+| ------------------------- | ------------------------ |
+| `python main.py test`     | Test Alpaca connection   |
+| `python main.py backtest` | Run historical backtest  |
+| `python main.py paper`    | Start paper trading      |
+| `python main.py analyze`  | Show performance metrics |
 
 ## Configuration (.env)
 
