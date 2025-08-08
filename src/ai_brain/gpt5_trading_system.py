@@ -32,7 +32,22 @@ class GPT5TradingBrain:
         self.client = AsyncOpenAI(
             api_key=os.getenv('OPENAI_API_KEY')
         )
-        self.model = "gpt-4o-mini"  # Use GPT-4o-mini (working model with your account)
+        
+        # Model hierarchy - will try in order if rate limited
+        self.model_hierarchy = [
+            "gpt-5",            # GPT-5 (when available - will fallback if not)
+            "gpt-4o",           # Best current model
+            "gpt-4-turbo",      # Fallback to GPT-4 Turbo
+            "gpt-4",            # Standard GPT-4
+            "gpt-3.5-turbo",    # Cheaper fallback
+            "gpt-4o-mini"       # Free/cheapest option
+        ]
+        self.current_model_index = 0
+        self.model = self.model_hierarchy[self.current_model_index]
+        
+        # Track rate limit issues
+        self.rate_limit_errors = 0
+        self.last_rate_limit_time = None
         
         # Web search capability
         self.tavily = TavilyClient(api_key=os.getenv('TAVILY_API_KEY'))
@@ -111,7 +126,8 @@ class GPT5TradingBrain:
         Every trade should have EXPLOSIVE potential with LIMITED downside.
         """
         
-        logger.info("GPT-5 Trading Brain initialized - Autonomous mode activated")
+        logger.info(f"GPT-5 Trading Brain initialized - Using model: {self.model}")
+        logger.info("Autonomous mode activated with automatic model fallback")
     
     async def autonomous_market_scan(self, research_mode: bool = False) -> List[Dict]:
         """
@@ -192,8 +208,7 @@ class GPT5TradingBrain:
         
         try:
             # GPT generates intelligent searches
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._make_gpt_request(
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": search_generation_prompt}
@@ -273,8 +288,7 @@ class GPT5TradingBrain:
         follow_up_searches = []
         hot_symbols = []
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._make_gpt_request(
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": initial_analysis_prompt}
@@ -315,7 +329,7 @@ class GPT5TradingBrain:
         
         for symbol in symbols_to_check:
             try:
-                snapshot = self.alpaca.get_snapshot(symbol)
+                snapshot = self.alpaca.get_snapshot(symbol, feed='iex')
                 if snapshot and snapshot.daily_bar:
                     change_pct = ((snapshot.latest_trade.price - snapshot.daily_bar.open) / 
                                  snapshot.daily_bar.open * 100)
@@ -382,8 +396,7 @@ class GPT5TradingBrain:
         
         try:
             # GPT analyzes the real search results
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._make_gpt_request(
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": analysis_prompt}
@@ -430,7 +443,7 @@ class GPT5TradingBrain:
             for opp in opportunities:
                 try:
                     # Get real-time price for validation
-                    snapshot = self.alpaca.get_snapshot(opp['symbol'])
+                    snapshot = self.alpaca.get_snapshot(opp['symbol'], feed='iex')
                     if snapshot and snapshot.latest_trade:
                         opp['current_price'] = snapshot.latest_trade.price
                         opp['validated'] = True
@@ -493,7 +506,7 @@ class GPT5TradingBrain:
             current_data = await self._get_current_data(symbol)
             
             # Get historical bars for technical analysis
-            bars = self.alpaca.get_bars(symbol, '1Day', limit=30).df
+            bars = self.alpaca.get_bars(symbol, '1Day', limit=30, feed='iex').df
             if not bars.empty:
                 current_data['avg_volume_30d'] = bars['volume'].mean()
                 current_data['high_52w'] = bars['high'].max()
@@ -546,8 +559,7 @@ class GPT5TradingBrain:
         
         try:
             # GPT-5 performs deep analysis
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._make_gpt_request(
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": analysis_prompt}
@@ -762,7 +774,7 @@ class GPT5TradingBrain:
         GPT-5 learns from its trades and adapts strategy
         """
         # Get recent trades
-        trades = self.alpaca.get_orders(status='closed', limit=50)
+        trades = self.alpaca.list_orders(status='closed', limit=50)
         
         learning_prompt = f"""
         Analyze my recent trading performance:
@@ -816,22 +828,27 @@ class GPT5TradingBrain:
             clock = self.alpaca.get_clock()
             
             if clock.is_open:
-                # During market hours, get intraday data
-                spy_snapshot = self.alpaca.get_snapshot('SPY')
-                spy_daily_bar = spy_snapshot.daily_bar
+                # During market hours, get intraday data (use IEX feed, not SIP)
+                try:
+                    spy_snapshot = self.alpaca.get_snapshot('SPY', feed='iex')
+                except:
+                    # Fallback to bars if snapshot fails
+                    spy_snapshot = None
+                    
+                spy_daily_bar = spy_snapshot.daily_bar if spy_snapshot else None
                 if spy_daily_bar:
                     spy_change = ((spy_daily_bar.close - spy_daily_bar.open) / 
                                  spy_daily_bar.open * 100)
                     logger.debug(f"SPY change from Alpaca: {spy_change:.2f}%")
             else:
                 # After hours, get last close
-                spy_bars = self.alpaca.get_bars('SPY', '1Day', limit=1).df
+                spy_bars = self.alpaca.get_bars('SPY', '1Day', limit=1, feed='iex').df
                 if not spy_bars.empty:
                     spy_change = 0.0  # No intraday change after hours
                     
             # Get volatility indicator (VIXY as VIX proxy)
             try:
-                vixy_snapshot = self.alpaca.get_snapshot('VIXY')
+                vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
                 if vixy_snapshot and vixy_snapshot.latest_trade:
                     vix_level = vixy_snapshot.latest_trade.price
             except:
@@ -861,16 +878,83 @@ class GPT5TradingBrain:
     async def _get_current_data(self, symbol: str) -> Dict:
         """Get current price and volume data"""
         try:
-            snapshot = self.alpaca.get_snapshot(symbol)
+            snapshot = self.alpaca.get_snapshot(symbol, feed='iex')
             return {
-                'price': snapshot.latest_trade.price,
-                'volume': snapshot.latest_trade.size,
-                'bid': snapshot.latest_quote.bid_price,
-                'ask': snapshot.latest_quote.ask_price,
-                'spread': snapshot.latest_quote.ask_price - snapshot.latest_quote.bid_price
+                'price': snapshot.latest_trade.price if snapshot.latest_trade else 0,
+                'volume': snapshot.latest_trade.size if snapshot.latest_trade else 0,
+                'bid': snapshot.latest_quote.bid_price if snapshot.latest_quote else 0,
+                'ask': snapshot.latest_quote.ask_price if snapshot.latest_quote else 0,
+                'spread': (snapshot.latest_quote.ask_price - snapshot.latest_quote.bid_price) if snapshot.latest_quote else 0
             }
-        except:
+        except Exception as e:
+            logger.debug(f"Could not get data for {symbol}: {e}")
             return {}
+    
+    async def _make_gpt_request(self, messages: list, temperature: float = 0.3, max_tokens: int = 2000) -> any:
+        """
+        Make a GPT request with automatic model fallback on rate limits
+        """
+        for attempt in range(len(self.model_hierarchy)):
+            try:
+                # Log which model we're using
+                if self.current_model_index > 0:
+                    logger.info(f"Using fallback model: {self.model}")
+                else:
+                    logger.debug(f"Using primary model: {self.model}")
+                
+                # Make the API call
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+                # If successful and we were in fallback, try to move back up
+                if self.current_model_index > 0 and self.rate_limit_errors == 0:
+                    # Been 5 minutes since last rate limit? Try better model
+                    if self.last_rate_limit_time and (datetime.now() - self.last_rate_limit_time).seconds > 300:
+                        self.current_model_index = max(0, self.current_model_index - 1)
+                        self.model = self.model_hierarchy[self.current_model_index]
+                        logger.info(f"Upgrading back to: {self.model}")
+                
+                return response
+                
+            except Exception as e:
+                error_message = str(e).lower()
+                
+                # Check if it's a rate limit error
+                if 'rate_limit' in error_message or '429' in error_message or 'quota' in error_message:
+                    self.rate_limit_errors += 1
+                    self.last_rate_limit_time = datetime.now()
+                    
+                    # Try next model in hierarchy
+                    if self.current_model_index < len(self.model_hierarchy) - 1:
+                        self.current_model_index += 1
+                        self.model = self.model_hierarchy[self.current_model_index]
+                        logger.warning(f"Rate limited on {self.model_hierarchy[self.current_model_index-1]}, falling back to {self.model}")
+                        continue
+                    else:
+                        logger.error("All models exhausted, waiting 60 seconds...")
+                        await asyncio.sleep(60)
+                        # Reset to try again from the current level
+                        continue
+                
+                # Check if it's an invalid model error (e.g., no access to gpt-5)
+                elif ('model' in error_message and ('not found' in error_message or 'does not exist' in error_message or 'model_not_found' in error_message)) or '404' in str(e):
+                    if self.current_model_index < len(self.model_hierarchy) - 1:
+                        self.current_model_index += 1
+                        self.model = self.model_hierarchy[self.current_model_index]
+                        logger.warning(f"No access to {self.model_hierarchy[self.current_model_index-1]}, using {self.model}")
+                        continue
+                
+                # Other errors - just raise
+                else:
+                    logger.error(f"GPT API error: {e}")
+                    raise e
+        
+        # If we get here, all attempts failed
+        raise Exception("All model attempts failed")
     
     def _parse_json_response(self, gpt_response: str) -> Dict:
         """Generic JSON parser for GPT responses"""

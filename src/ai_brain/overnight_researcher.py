@@ -13,49 +13,83 @@ class OvernightResearcher:
     """
     Manages overnight research and watchlist building
     Goal: Have 6 HIGH-CONFIDENCE stocks ready at market open
+    Watchlist persists and improves throughout the night
     """
     
     def __init__(self, trading_brain):
         self.brain = trading_brain
-        self.watchlist = []  # Max 6 stocks
+        self.watchlist = []  # Max 6 stocks - PERSISTS all night
         self.max_watchlist_size = 6
         self.research_history = {}  # Track how deeply we've researched each stock
-        self.confidence_threshold = 75  # Minimum confidence to make the list
+        self.confidence_threshold = 70  # Minimum confidence to make the list (lowered to allow growth)
+        self.cycle_count = 0  # Track how many cycles we've done
+        self.last_reset_hour = None  # Track when we last reset (new day)
+        
+        # Balance between deepening vs discovering (changes through the night)
+        self.discovery_energy = 0.5  # Start with 50/50 balance
+        self.removed_stocks = []  # Track what we've already rejected tonight
         
     async def overnight_research_cycle(self) -> List[Dict]:
         """
-        Main overnight research cycle
+        Main overnight research cycle - builds on previous cycles
         Returns updated watchlist with confidence scores
         """
-        logger.info("🌙 Starting overnight research cycle")
+        self.cycle_count += 1
+        current_hour = datetime.now().hour
         
-        # Step 1: Determine research focus based on watchlist status
-        current_count = len(self.watchlist)
-        needs_discovery = current_count < self.max_watchlist_size
+        # Reset watchlist at midnight for new trading day
+        if current_hour == 0 and self.last_reset_hour != 0:
+            logger.info("🔄 Midnight reset - Starting fresh for new trading day")
+            self.reset_for_new_day()
+        self.last_reset_hour = current_hour
         
-        if needs_discovery:
-            logger.info(f"📊 Watchlist has {current_count}/{self.max_watchlist_size} stocks - DISCOVERING NEW")
-            # Find new opportunities
-            new_opportunities = await self._discover_opportunities()
-            
-            # Add best new opportunities to watchlist
-            for opp in new_opportunities:
-                if len(self.watchlist) < self.max_watchlist_size:
-                    if opp.get('confidence', 0) >= self.confidence_threshold:
-                        self.watchlist.append(opp)
-                        self.research_history[opp['symbol']] = 1
-                        logger.info(f"✅ Added {opp['symbol']} to watchlist (Confidence: {opp['confidence']}%)")
+        logger.info(f"🌙 Overnight research cycle #{self.cycle_count}")
+        logger.info(f"📊 Current watchlist: {len(self.watchlist)}/{self.max_watchlist_size} stocks")
         
-        # Step 2: Deep dive on existing watchlist
-        if self.watchlist:
-            logger.info(f"🔬 Deep researching {len(self.watchlist)} watchlist stocks")
+        # Adjust discovery vs deepening balance based on time and list status
+        hours_until_open = self._hours_until_market_open()
+        list_completeness = len(self.watchlist) / self.max_watchlist_size
+        
+        # More discovery early in night, more deepening as morning approaches
+        if hours_until_open > 6:
+            self.discovery_energy = 0.7 if list_completeness < 0.8 else 0.3
+        elif hours_until_open > 3:
+            self.discovery_energy = 0.5 if list_completeness < 1.0 else 0.2
+        else:
+            self.discovery_energy = 0.3 if list_completeness < 1.0 else 0.1
+        
+        logger.info(f"⚖️ Research balance: {int(self.discovery_energy*100)}% discovery, {int((1-self.discovery_energy)*100)}% deepening")
+        
+        # Step 1: Deepen existing watchlist (use portion of energy)
+        if self.watchlist and self.discovery_energy < 1.0:
+            logger.info(f"🔬 Deepening research on existing {len(self.watchlist)} stocks")
             self.watchlist = await self._deep_research_watchlist()
         
-        # Step 3: Rank and potentially replace low-confidence stocks
+        # Step 2: Discover new opportunities (use portion of energy)
+        if self.discovery_energy > 0 and len(self.watchlist) < self.max_watchlist_size:
+            slots_available = self.max_watchlist_size - len(self.watchlist)
+            logger.info(f"🔍 Searching for {slots_available} new opportunities")
+            
+            new_opportunities = await self._discover_opportunities()
+            
+            # Add new opportunities that aren't in removed list
+            for opp in new_opportunities:
+                symbol = opp['symbol']
+                if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
+                    # Check if already in watchlist
+                    if not any(stock['symbol'] == symbol for stock in self.watchlist):
+                        if opp.get('confidence', 0) >= self.confidence_threshold:
+                            opp['discovered_cycle'] = self.cycle_count
+                            opp['research_depth'] = 1
+                            self.watchlist.append(opp)
+                            self.research_history[symbol] = 1
+                            logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+        
+        # Step 3: Optimize - remove low confidence, keep building toward 6
         self.watchlist = await self._optimize_watchlist()
         
-        # Step 4: Prepare final pre-market analysis
-        self._prepare_market_open_strategy()
+        # Step 4: Show current status
+        self._show_watchlist_status()
         
         return self.watchlist
     
@@ -99,20 +133,30 @@ class OvernightResearcher:
     async def _deep_research_watchlist(self) -> List[Dict]:
         """
         Perform deeper research on existing watchlist stocks
+        Preserves all previous findings and builds on them
         """
         updated_watchlist = []
         
         for stock in self.watchlist:
             symbol = stock['symbol']
-            research_depth = self.research_history.get(symbol, 0)
+            research_depth = stock.get('research_depth', 1)
+            
+            # Compile all previous findings
+            previous_findings = stock.get('research_notes', [])
+            findings_summary = "\n".join([f"- Cycle {f['cycle']}: {f['finding']}" for f in previous_findings[-5:]])
             
             # Deeper research based on how many times we've looked at it
             research_prompt = f"""
             DEEP RESEARCH - Level {research_depth + 1} Analysis
             
             Stock: {symbol}
-            Previous confidence: {stock.get('confidence', 0)}%
+            Current confidence: {stock.get('confidence', 0)}%
             Original catalyst: {stock.get('catalyst', 'Unknown')}
+            Discovered in cycle: {stock.get('discovered_cycle', 0)}
+            Research depth: {research_depth}
+            
+            Previous findings:
+            {findings_summary}
             
             Perform {"DEEPER" if research_depth > 0 else "INITIAL"} research:
             
@@ -162,17 +206,34 @@ class OvernightResearcher:
                 # Parse updated confidence
                 analysis = self.brain._parse_json_response(response.choices[0].message.content)
                 
-                # Update stock info
+                # Update stock info while preserving history
+                old_confidence = stock['confidence']
                 stock['confidence'] = analysis.get('confidence', stock['confidence'])
                 stock['updated_analysis'] = analysis.get('reasoning', '')
                 stock['research_depth'] = research_depth + 1
                 
+                # Add new finding to research notes
+                if 'research_notes' not in stock:
+                    stock['research_notes'] = []
+                
+                new_finding = {
+                    'cycle': self.cycle_count,
+                    'finding': analysis.get('reasoning', '')[:200],
+                    'confidence_change': stock['confidence'] - old_confidence,
+                    'depth': research_depth + 1
+                }
+                stock['research_notes'].append(new_finding)
+                
+                # Keep all context from previous cycles
+                stock['last_updated_cycle'] = self.cycle_count
+                
                 self.research_history[symbol] = research_depth + 1
                 
-                if stock['confidence'] >= self.confidence_threshold:
+                if stock['confidence'] >= self.confidence_threshold - 5:  # Give stocks a chance
                     updated_watchlist.append(stock)
-                    logger.info(f"  {symbol}: Updated confidence {stock['confidence']}% (depth: {research_depth + 1})")
+                    logger.info(f"  {symbol}: Confidence {stock['confidence']}% ({'+' if stock['confidence'] > old_confidence else ''}{stock['confidence'] - old_confidence}%) - Depth {research_depth + 1}")
                 else:
+                    self.removed_stocks.append(symbol)
                     logger.warning(f"  {symbol}: Removed - confidence dropped to {stock['confidence']}%")
                     
             except Exception as e:
@@ -215,6 +276,53 @@ class OvernightResearcher:
         
         return self.watchlist
     
+    def _hours_until_market_open(self) -> float:
+        """Calculate hours until market opens (9:30 AM ET)"""
+        now = datetime.now()
+        market_open = now.replace(hour=9, minute=30, second=0)
+        
+        # If past 9:30 AM, calculate for next day
+        if now.hour >= 9 and now.minute >= 30:
+            market_open += timedelta(days=1)
+        
+        hours = (market_open - now).total_seconds() / 3600
+        return max(0, hours)
+    
+    def _show_watchlist_status(self):
+        """Show current watchlist status with details"""
+        if not self.watchlist:
+            logger.warning("⚠️ Watchlist empty - searching for opportunities")
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"📋 WATCHLIST STATUS - Cycle #{self.cycle_count}")
+        logger.info("=" * 60)
+        
+        # Sort by confidence
+        self.watchlist.sort(key=lambda x: x.get('confidence', 0), reverse=True)
+        
+        for i, stock in enumerate(self.watchlist, 1):
+            confidence = stock.get('confidence', 0)
+            depth = stock.get('research_depth', 1)
+            discovered = stock.get('discovered_cycle', 0)
+            
+            # Show confidence trend
+            if stock.get('research_notes'):
+                recent_changes = [n['confidence_change'] for n in stock['research_notes'][-3:]]
+                trend = "📈" if sum(recent_changes) > 0 else "📉" if sum(recent_changes) < 0 else "➡️"
+            else:
+                trend = "🆕"
+            
+            logger.info(f"{i}. {stock['symbol']} {trend} - {confidence}% confidence")
+            logger.info(f"   Catalyst: {stock.get('catalyst', 'N/A')[:60]}")
+            logger.info(f"   Research: Depth {depth} | Added cycle {discovered} | Updated cycle {stock.get('last_updated_cycle', discovered)}")
+        
+        avg_confidence = sum(s.get('confidence', 0) for s in self.watchlist) / len(self.watchlist)
+        logger.info("=" * 60)
+        logger.info(f"Average confidence: {avg_confidence:.1f}%")
+        logger.info(f"Hours until market: {self._hours_until_market_open():.1f}h")
+        logger.info("=" * 60)
+    
     def _prepare_market_open_strategy(self):
         """
         Prepare final strategy for market open
@@ -245,10 +353,27 @@ class OvernightResearcher:
         """
         return self.watchlist[:count]
     
+    def reset_for_new_day(self):
+        """
+        Reset for a new trading day (called at midnight)
+        """
+        self.watchlist = []
+        self.research_history = {}
+        self.removed_stocks = []
+        self.cycle_count = 0
+        self.discovery_energy = 0.5
+        logger.info("🔄 Reset for new trading day - starting fresh")
+    
     def clear_watchlist(self):
         """
         Clear the watchlist (call after market opens and positions are taken)
         """
+        # Save best performers for learning
+        if self.watchlist:
+            top_picks = [s['symbol'] for s in self.watchlist[:3]]
+            logger.info(f"📝 Today's top picks were: {', '.join(top_picks)}")
+        
         self.watchlist = []
         self.research_history = {}
-        logger.info("Watchlist cleared for new session")
+        self.removed_stocks = []
+        logger.info("Watchlist cleared after market open execution")
