@@ -113,33 +113,64 @@ class GPT5TradingBrain:
         
         logger.info("GPT-5 Trading Brain initialized - Autonomous mode activated")
     
-    async def autonomous_market_scan(self) -> List[Dict]:
+    async def autonomous_market_scan(self, research_mode: bool = False) -> List[Dict]:
         """
         GPT-5 scans the entire market using dynamic, intelligent search
         GPT generates its own search queries based on reasoning and market conditions
+        
+        Args:
+            research_mode: If True, focuses on next-day catalysts and preparation
         """
         
         # Get current market context
         market_data = await self._get_market_context()
         
+        # Determine if we're in research mode (market closed)
+        clock = self.alpaca.get_clock()
+        is_market_closed = not clock.is_open
+        research_mode = research_mode or is_market_closed
+        
         # Step 1: Let GPT generate intelligent search queries based on market conditions
+        mode_context = "RESEARCH MODE - Preparing for next trading session" if research_mode else "LIVE TRADING MODE"
+        
         search_generation_prompt = f"""
         Current Market Context:
         - Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST
         - Day: {datetime.now().strftime('%A')}
         - Market Status: {market_data['market_status']}
+        - Mode: {mode_context}
         - SPY Change: {market_data['spy_change']}%
         - VIX Level: {market_data['vix_level']} ({"high volatility" if market_data['vix_level'] > 30 else "normal"})
         
-        Generate 8-10 INTELLIGENT search queries to find trading opportunities.
+        {"Focus on TOMORROW's catalysts and overnight developments:" if research_mode else "Find IMMEDIATE trading opportunities:"}
+        
+        Generate 8-10 INTELLIGENT search queries to find {"tomorrow's opportunities" if research_mode else "trading opportunities NOW"}.
         Think like a hedge fund analyst - what information would give us an edge?
         
         Consider:
-        1. What sectors are likely moving today based on SPY/VIX?
+        1. What sectors are likely moving {"tomorrow" if research_mode else "today"} based on SPY/VIX?
         2. What time-sensitive events are happening (FDA, earnings, Fed)?
         3. What social sentiment shifts might be occurring?
         4. What technical setups are completing?
         5. What correlations or connections others might miss?
+        
+        {"RESEARCH MODE FOCUS:" if research_mode else "LIVE TRADING FOCUS:"}
+        {'''
+        - Tomorrow's pre-market catalysts (earnings before open)
+        - FDA decisions or clinical trial results due
+        - Asian/European market movements affecting US stocks
+        - After-hours earnings reports from today
+        - Reddit/Twitter sentiment building overnight
+        - Gap up/down candidates for tomorrow
+        - Stocks near technical breakouts
+        ''' if research_mode else '''
+        - Immediate catalysts driving moves NOW
+        - Volume spikes and momentum plays
+        - Breaking news and sudden developments  
+        - Intraday technical setups
+        - Options flow indicating big moves
+        - Social media trending RIGHT NOW
+        '''}
         
         Generate searches that will uncover:
         - Hidden catalysts before mainstream media

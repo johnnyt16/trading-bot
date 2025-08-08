@@ -10,6 +10,7 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).parent))
 
 from src.ai_brain.gpt5_trading_system import GPT5TradingBrain
+from src.ai_brain.overnight_researcher import OvernightResearcher
 from loguru import logger
 
 async def main():
@@ -20,9 +21,13 @@ async def main():
         # Initialize the AI brain
         logger.info("Initializing GPT-5 Trading System...")
         brain = GPT5TradingBrain()
+        overnight_researcher = OvernightResearcher(brain)
         
         logger.info("🚀 GPT-5 Autonomous Trading Started")
         logger.info("Target: $1,000 → $10,000")
+        
+        # Track if we've already executed morning trades
+        morning_trades_executed = False
         
         # The main trading loop
         while True:
@@ -38,21 +43,80 @@ async def main():
             
             if not clock.is_open and not is_extended:
                 next_open = clock.next_open.strftime('%Y-%m-%d %H:%M:%S ET')
-                logger.info(f"Market closed. Next open: {next_open}")
-                logger.info("Waiting 5 minutes...")
-                await asyncio.sleep(300)  # 5 minutes
+                hours_until_open = (clock.next_open - datetime.now()).total_seconds() / 3600
+                logger.info(f"Market closed. Opens in {hours_until_open:.1f} hours at {next_open}")
+                
+                # OVERNIGHT RESEARCH MODE - Build watchlist of 6 high-confidence stocks
+                logger.info("🌙 OVERNIGHT RESEARCH MODE - Building tomorrow's watchlist")
+                
+                # Run the overnight research cycle
+                watchlist = await overnight_researcher.overnight_research_cycle()
+                
+                # Show current watchlist status
+                if watchlist:
+                    logger.info(f"📋 Current watchlist: {len(watchlist)}/{overnight_researcher.max_watchlist_size} stocks")
+                    avg_confidence = sum(s.get('confidence', 0) for s in watchlist) / len(watchlist)
+                    logger.info(f"   Average confidence: {avg_confidence:.1f}%")
+                    
+                    # Show top 3
+                    for stock in watchlist[:3]:
+                        logger.info(f"   • {stock['symbol']}: {stock.get('confidence')}% - {stock.get('catalyst', 'N/A')[:40]}")
+                
+                # Learn from recent trades every hour
+                if datetime.now().minute < 10:
+                    logger.info("📚 Analyzing recent performance...")
+                    await brain.learn_and_adapt()
+                
+                # Reset morning trades flag when new day starts
+                if datetime.now().hour == 0:
+                    morning_trades_executed = False
+                
+                # Wait longer during deep overnight (less frequent checks)
+                wait_minutes = 15 if hours_until_open > 6 else 10 if hours_until_open > 2 else 5
+                logger.info(f"Next research cycle in {wait_minutes} minutes...")
+                await asyncio.sleep(wait_minutes * 60)
                 continue
             
             if is_premarket:
                 logger.info("🌅 PRE-MARKET TRADING (4 AM - 9:30 AM ET)")
                 logger.info("Prime time for news reactions and gap plays!")
+                
+                # Execute watchlist trades at pre-market open (4 AM) if we have them
+                if not morning_trades_executed and current_hour == 4 and overnight_researcher.watchlist:
+                    logger.info("🚀 EXECUTING OVERNIGHT WATCHLIST - Top opportunities from research")
+                    top_opportunities = overnight_researcher.get_top_opportunities(3)  # Execute top 3
+                    
+                    for opp in top_opportunities:
+                        logger.info(f"Analyzing watchlist stock: {opp['symbol']}")
+                        analysis = await brain.deep_analysis(opp['symbol'])
+                        
+                        if analysis['decision'] == 'GO':
+                            await brain.execute_trade(analysis)
+                            morning_trades_executed = True
+                    
+                    # Clear watchlist after execution
+                    overnight_researcher.clear_watchlist()
+                    
             elif is_afterhours:
                 logger.info("🌙 AFTER-HOURS TRADING (4 PM - 8 PM ET)")
                 logger.info("Earnings reactions and news catalysts!")
             elif clock.is_open:
                 logger.info("📈 Regular market hours active")
+                
+                # Execute watchlist at market open if not done in pre-market
+                if not morning_trades_executed and current_hour == 9 and current_time.minute >= 30 and overnight_researcher.watchlist:
+                    logger.info("🔔 MARKET OPEN - Executing overnight watchlist")
+                    top_opportunities = overnight_researcher.get_top_opportunities(3)
+                    
+                    for opp in top_opportunities:
+                        analysis = await brain.deep_analysis(opp['symbol'])
+                        if analysis['decision'] == 'GO':
+                            await brain.execute_trade(analysis)
+                            morning_trades_executed = True
+                    
+                    overnight_researcher.clear_watchlist()
             
-            # GPT-5 does everything
+            # Regular scanning for more opportunities
             logger.info("🔍 Scanning for opportunities...")
             opportunities = await brain.autonomous_market_scan()
             
