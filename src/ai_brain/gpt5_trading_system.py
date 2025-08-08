@@ -9,6 +9,7 @@ import asyncio
 import json
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+from collections import deque
 import openai
 from openai import AsyncOpenAI
 import alpaca_trade_api as tradeapi
@@ -18,6 +19,7 @@ import numpy as np
 from tavily import TavilyClient  # Web search API
 import yfinance as yf  # Keep for fundamental research
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 
@@ -33,18 +35,39 @@ class GPT5TradingBrain:
             api_key=os.getenv('OPENAI_API_KEY')
         )
 
-        # Model hierarchy - will try in order if rate limited
-        self.model_hierarchy = [
-            "gpt-5",            # GPT-5 (may not be available)
-            "gpt-4o",           # Best current model
-            "gpt-4-turbo",      # Fallback to GPT-4 Turbo
-            "gpt-4",            # Standard GPT-4
-            "gpt-3.5-turbo",    # Cheaper fallback
-            "gpt-4o-mini"       # Free/cheapest option
-        ]
+        # Cost mode and cadence controls
+        self.cost_mode = os.getenv('COST_MODE', 'low').lower()  # low | medium | high
+        # Scan cadence and limits (env overrideable)
+        self.scan_min_interval_seconds = int(os.getenv('SCAN_MIN_INTERVAL_SECONDS', '300'))  # 5m default
+        self.deep_analysis_min_interval_seconds = int(os.getenv('DEEP_ANALYSIS_MIN_INTERVAL_SECONDS', '900'))  # 15m default
+        self.position_management_min_interval_seconds = int(os.getenv('POSITION_MANAGEMENT_MIN_INTERVAL_SECONDS', '600'))  # 10m
+        self.max_gpt_requests_per_hour = int(os.getenv('MAX_GPT_REQUESTS_PER_HOUR', '30'))
+        # Token cap by mode
+        if self.cost_mode == 'low':
+            self.model_hierarchy = [
+                "gpt-4o-mini",
+                "gpt-3.5-turbo",
+                "gpt-4o",
+                "gpt-4-turbo",
+            ]
+            self.max_tokens_cap = int(os.getenv('MAX_TOKENS_CAP', '700'))
+        elif self.cost_mode == 'medium':
+            self.model_hierarchy = [
+                "gpt-4o-mini",
+                "gpt-4o",
+                "gpt-4-turbo",
+            ]
+            self.max_tokens_cap = int(os.getenv('MAX_TOKENS_CAP', '1200'))
+        else:  # high
+            self.model_hierarchy = [
+                "gpt-4o",
+                "gpt-4-turbo",
+                "gpt-4o-mini",
+            ]
+            self.max_tokens_cap = int(os.getenv('MAX_TOKENS_CAP', '2000'))
 
-        # Start with an available model to avoid first-call 404s; upgrade later if possible
-        self.current_model_index = 1
+        # Start with the first model for the selected mode
+        self.current_model_index = 0
         self.model = self.model_hierarchy[self.current_model_index]
         
         # Track rate limit issues
@@ -90,6 +113,15 @@ class GPT5TradingBrain:
             # If parsing fails, keep defaults
             pass
         
+        # Simple budget tracking for GPT calls (rolling 1h window)
+        self._gpt_call_times: deque = deque()
+
+        # Caches and cooldowns to avoid repeated GPT work
+        self._last_market_scan_at: Optional[datetime] = None
+        self._last_market_scan_result: List[Dict] = []
+        self._last_analysis_by_symbol: Dict[str, Dict] = {}
+        self._last_position_management_at: Optional[datetime] = None
+
         # Track AI's performance and learning
         self.ai_memory = []
         self.successful_patterns = []
@@ -151,6 +183,8 @@ class GPT5TradingBrain:
         
         logger.info(f"GPT-5 Trading Brain initialized - Using model: {self.model}")
         logger.info("Autonomous mode activated with automatic model fallback")
+        logger.info(f"Cost mode: {self.cost_mode} | max_tokens_cap: {self.max_tokens_cap} | max_gpt_requests_per_hour: {self.max_gpt_requests_per_hour}")
+        logger.info(f"Cadence: scan>={self.scan_min_interval_seconds}s, deep_analysis>={self.deep_analysis_min_interval_seconds}s, manage_positions>={self.position_management_min_interval_seconds}s")
     
     async def autonomous_market_scan(self, research_mode: bool = False) -> List[Dict]:
         """
@@ -161,6 +195,11 @@ class GPT5TradingBrain:
             research_mode: If True, focuses on next-day catalysts and preparation
         """
         
+        # Cooldown and caching to reduce API usage
+        now = datetime.now()
+        if self._last_market_scan_at and (now - self._last_market_scan_at).total_seconds() < self.scan_min_interval_seconds:
+            return self._last_market_scan_result
+
         # Get current market context
         market_data = await self._get_market_context()
         
@@ -172,10 +211,12 @@ class GPT5TradingBrain:
         # Step 1: Let GPT generate intelligent search queries based on market conditions
         mode_context = "RESEARCH MODE - Preparing for next trading session" if research_mode else "LIVE TRADING MODE"
         
+        # Eastern Time string for prompts
+        et_now = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern'))
         search_generation_prompt = f"""
         Current Market Context:
-        - Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST
-        - Day: {datetime.now().strftime('%A')}
+        - Time: {et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
+        - Day: {et_now.strftime('%A')}
         - Market Status: {market_data['market_status']}
         - Mode: {mode_context}
         - SPY Change: {market_data['spy_change']}%
@@ -229,26 +270,25 @@ class GPT5TradingBrain:
         Be creative and think deeply. What would give us an edge TODAY specifically?
         """
         
+        use_dynamic_searches = self.cost_mode != 'low'
         try:
-            # GPT generates intelligent searches
-            response = await self._make_gpt_request(
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": search_generation_prompt}
-                ],
-                temperature=0.5,  # More creative for search generation
-                max_tokens=1000
-            )
-            
-            # Parse GPT's search suggestions
-            search_data = self._parse_json_response(response.choices[0].message.content)
-            searches = search_data.get('searches', [])
-            
-            logger.info(f"GPT generated {len(searches)} intelligent searches")
-            
+            if use_dynamic_searches:
+                # GPT generates intelligent searches (skipped in low-cost mode)
+                response = await self._make_gpt_request(
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": search_generation_prompt}
+                    ],
+                    temperature=0.5,  # More creative for search generation
+                    max_tokens=600
+                )
+                search_data = self._parse_json_response(response.choices[0].message.content)
+                searches = search_data.get('searches', [])
+                logger.info(f"GPT generated {len(searches)} intelligent searches")
+            else:
+                raise Exception("Low-cost mode: skipping GPT search generation")
         except Exception as e:
-            logger.warning(f"Failed to generate dynamic searches: {e}")
-            # Fallback to default searches
+            logger.info(f"Using default searches ({e})")
             searches = [
                 {"query": f"reddit wallstreetbets trending stocks {datetime.now().strftime('%B %d')} sentiment", "purpose": "Social sentiment"},
                 {"query": f"unusual options activity call sweeps {datetime.now().strftime('%B %d')}", "purpose": "Smart money flow"},
@@ -259,7 +299,8 @@ class GPT5TradingBrain:
         
         # Step 2: Execute the searches (including social media)
         all_search_results = []
-        for search_item in searches[:5]:  # Limit to top 5 to avoid rate limits
+        max_queries = 3 if self.cost_mode == 'low' else 5 if self.cost_mode == 'medium' else 6
+        for search_item in searches[:max_queries]:
             query = search_item.get('query', search_item) if isinstance(search_item, dict) else search_item
             try:
                 logger.debug(f"Searching: {query}")
@@ -268,13 +309,13 @@ class GPT5TradingBrain:
                 if any(term in query.lower() for term in ['reddit', 'wsb', 'twitter', 'social', 'sentiment']):
                     # Search with social media focus
                     results = self.tavily.search(
-                        query, 
-                        max_results=5,
+                        query,
+                        max_results=3 if self.cost_mode == 'low' else 5,
                         include_domains=["reddit.com", "twitter.com", "stocktwits.com"] if 'reddit' in query.lower() or 'social' in query.lower() else None
                     )
                 else:
                     # Regular search
-                    results = self.tavily.search(query, max_results=5)
+                    results = self.tavily.search(query, max_results=3 if self.cost_mode == 'low' else 5)
                 
                 all_search_results.append({
                     'query': query,
@@ -307,39 +348,37 @@ class GPT5TradingBrain:
         }}
         """
         
-        # Let GPT reason about initial findings and search deeper
+        # Let GPT reason about initial findings and search deeper (skip in low-cost mode)
         follow_up_searches = []
         hot_symbols = []
         try:
-            response = await self._make_gpt_request(
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": initial_analysis_prompt}
-                ],
-                temperature=0.4,
-                max_tokens=1000
-            )
-            
-            follow_up_data = self._parse_json_response(response.choices[0].message.content)
-            follow_up_searches = follow_up_data.get('follow_up_searches', [])
-            hot_symbols = follow_up_data.get('hot_symbols', [])
-            insights = follow_up_data.get('insights', '')
-            
-            logger.info(f"GPT insights: {insights[:200]}")
-            
-            # Execute follow-up searches
-            for follow_up in follow_up_searches[:3]:
-                query = follow_up.get('query', follow_up) if isinstance(follow_up, dict) else follow_up
-                try:
-                    logger.debug(f"Follow-up search: {query}")
-                    results = self.tavily.search(query, max_results=3)
-                    all_search_results.append({
-                        'query': query,
-                        'purpose': f"FOLLOW-UP: {follow_up.get('reason', '')}",
-                        'results': results.get('results', [])
-                    })
-                except:
-                    pass
+            if self.cost_mode != 'low':
+                response = await self._make_gpt_request(
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": initial_analysis_prompt}
+                    ],
+                    temperature=0.4,
+                    max_tokens=600
+                )
+                follow_up_data = self._parse_json_response(response.choices[0].message.content)
+                follow_up_searches = follow_up_data.get('follow_up_searches', [])
+                hot_symbols = follow_up_data.get('hot_symbols', [])
+                insights = follow_up_data.get('insights', '')
+                logger.info(f"GPT insights: {insights[:200]}")
+                # Execute follow-up searches
+                for follow_up in follow_up_searches[:2]:
+                    query = follow_up.get('query', follow_up) if isinstance(follow_up, dict) else follow_up
+                    try:
+                        logger.debug(f"Follow-up search: {query}")
+                        results = self.tavily.search(query, max_results=3)
+                        all_search_results.append({
+                            'query': query,
+                            'purpose': f"FOLLOW-UP: {follow_up.get('reason', '')}",
+                            'results': results.get('results', [])
+                        })
+                    except:
+                        pass
                     
         except Exception as e:
             logger.warning(f"Follow-up search generation failed: {e}")
@@ -348,7 +387,7 @@ class GPT5TradingBrain:
         market_movers = []
         
         # Add GPT-identified hot symbols to check list
-        symbols_to_check = list(set(['NVDA', 'TSLA', 'AAPL', 'AMD', 'META', 'GOOGL', 'MSFT'] + hot_symbols[:10]))
+        symbols_to_check = list(set(['NVDA', 'TSLA', 'AAPL', 'AMD', 'META', 'GOOGL', 'MSFT'] + hot_symbols[:5]))
         
         for symbol in symbols_to_check:
             try:
@@ -425,7 +464,7 @@ class GPT5TradingBrain:
                     {"role": "user", "content": analysis_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=2000
+                max_tokens=900
             )
             
             # Parse opportunities from GPT response
@@ -491,6 +530,9 @@ class GPT5TradingBrain:
                           f"(Confidence: {opp.get('confidence', 0)}%, "
                           f"Target: {opp.get('target_move', 0)}%)")
             
+            # Cache results with timestamp
+            self._last_market_scan_at = datetime.now()
+            self._last_market_scan_result = validated_opportunities
             return validated_opportunities
             
         except Exception as e:
@@ -580,6 +622,12 @@ class GPT5TradingBrain:
         RESPOND ONLY WITH THE JSON, NO OTHER TEXT.
         """
         
+        # Respect per-symbol cooldown
+        last = self._last_analysis_by_symbol.get(symbol)
+        now = datetime.now()
+        if last and (now - last.get('ts', now)).total_seconds() < self.deep_analysis_min_interval_seconds:
+            return last['result']
+
         try:
             # GPT-5 performs deep analysis
             response = await self._make_gpt_request(
@@ -588,7 +636,7 @@ class GPT5TradingBrain:
                     {"role": "user", "content": analysis_prompt}
                 ],
                 temperature=0.2,  # Even more focused for analysis
-                max_tokens=2000
+                max_tokens=900
             )
             
             # Parse the analysis
@@ -613,6 +661,8 @@ class GPT5TradingBrain:
             logger.info(f"Analysis for {symbol}: {analysis['decision']} "
                        f"(Confidence: {analysis['confidence']}%)")
             
+            # Cache
+            self._last_analysis_by_symbol[symbol] = {'ts': datetime.now(), 'result': analysis}
             return analysis
             
         except Exception as e:
@@ -693,10 +743,15 @@ class GPT5TradingBrain:
             shares = int(position.qty)
             
             # Search for real-time updates on this position
+            # Only run heavy GPT management at a lower cadence or when thresholds trigger
+            if self._last_position_management_at:
+                seconds_since = (datetime.now() - self._last_position_management_at).total_seconds()
+                if seconds_since < self.position_management_min_interval_seconds and abs(pnl_pct) < 5:
+                    continue
             try:
                 position_search = self.tavily.search(
                     f"{symbol} stock news latest {datetime.now().strftime('%B %d')}",
-                    max_results=3
+                    max_results=2
                 )
                 search_results = position_search.get('results', [])
             except:
@@ -744,7 +799,8 @@ class GPT5TradingBrain:
                         {"role": "system", "content": self.system_prompt},
                         {"role": "user", "content": management_prompt}
                     ],
-                    temperature=0.2
+                    temperature=0.2,
+                    max_tokens=500
                 )
                 
                 decision = self._parse_json_response(response.choices[0].message.content)
@@ -785,11 +841,12 @@ class GPT5TradingBrain:
                 elif action == 'ADD':
                     # Could add to position if we want
                     logger.info(f"🎯 Considering adding to {symbol}")
-                    
+                
                 # Default is HOLD - do nothing
                 
             except Exception as e:
                 logger.error(f"Failed to manage {symbol}: {e}")
+        self._last_position_management_at = datetime.now()
     
     async def learn_and_adapt(self):
         """
@@ -878,7 +935,7 @@ class GPT5TradingBrain:
                 if not vix_hist.empty:
                     vix_level = float(vix_hist['Close'].iloc[-1])
                     logger.debug(f"VIX level from yfinance: {vix_level:.2f}")
-            except Exception:
+            except Exception as _:
                 try:
                     vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
                     if vixy_snapshot and vixy_snapshot.latest_trade:
@@ -927,6 +984,13 @@ class GPT5TradingBrain:
         """
         Make a GPT request with automatic model fallback on rate limits
         """
+        # Budget check (rolling 1h window)
+        now = datetime.now()
+        while self._gpt_call_times and (now - self._gpt_call_times[0]).total_seconds() > 3600:
+            self._gpt_call_times.popleft()
+        if len(self._gpt_call_times) >= self.max_gpt_requests_per_hour:
+            raise Exception("OpenAI budget exhausted for this hour; skipping GPT call")
+
         for attempt in range(len(self.model_hierarchy)):
             try:
                 # Log which model we're using
@@ -940,9 +1004,12 @@ class GPT5TradingBrain:
                     model=self.model,
                     messages=messages,
                     temperature=temperature,
-                    max_tokens=max_tokens
+                    max_tokens=min(max_tokens, self.max_tokens_cap),
                 )
                 
+                # Record budget usage
+                self._gpt_call_times.append(now)
+
                 # If successful and we were in fallback, try to move back up
                 if self.current_model_index > 0 and self.rate_limit_errors == 0:
                     # Been 5 minutes since last rate limit? Try better model

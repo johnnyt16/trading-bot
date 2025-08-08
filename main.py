@@ -7,6 +7,7 @@ import asyncio
 import sys
 from pathlib import Path
 from datetime import datetime
+import os
 import pytz
 sys.path.append(str(Path(__file__).parent))
 
@@ -147,7 +148,7 @@ async def main():
                     
                     overnight_researcher.clear_watchlist()
             
-            # Regular scanning for more opportunities
+            # Regular scanning for more opportunities (respect cost mode cadence)
             logger.info("🔍 Scanning for opportunities...")
             opportunities = await brain.autonomous_market_scan()
             
@@ -172,8 +173,14 @@ async def main():
             if current_time.minute == 0:
                 await brain.learn_and_adapt()
             
-            # Wait 30 seconds before next scan
-            await asyncio.sleep(30)
+            # Adjust loop sleep by cost mode and session
+            cost_mode = os.getenv('COST_MODE', 'low').lower()
+            if is_premarket or clock.is_open:
+                # During active sessions, still avoid hammering
+                sleep_seconds = 60 if cost_mode == 'low' else 45 if cost_mode == 'medium' else 30
+            else:
+                sleep_seconds = 300 if cost_mode == 'low' else 180 if cost_mode == 'medium' else 120
+            await asyncio.sleep(sleep_seconds)
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")

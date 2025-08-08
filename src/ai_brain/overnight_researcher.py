@@ -7,6 +7,7 @@ Continuously refines a list of 6 top opportunities while market is closed
 import json
 from typing import Dict, List
 from datetime import datetime, timedelta
+import pytz
 from loguru import logger
 
 class OvernightResearcher:
@@ -35,7 +36,7 @@ class OvernightResearcher:
         Returns updated watchlist with confidence scores
         """
         self.cycle_count += 1
-        current_hour = datetime.now().hour
+        current_hour = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern')).hour
         
         # Reset watchlist at midnight for new trading day
         if current_hour == 0 and self.last_reset_hour != 0:
@@ -276,16 +277,15 @@ class OvernightResearcher:
         return self.watchlist
     
     def _hours_until_market_open(self) -> float:
-        """Calculate hours until market opens (9:30 AM ET)"""
-        now = datetime.now()
-        market_open = now.replace(hour=9, minute=30, second=0)
-        
-        # If past 9:30 AM, calculate for next day
-        if now.hour >= 9 and now.minute >= 30:
-            market_open += timedelta(days=1)
-        
-        hours = (market_open - now).total_seconds() / 3600
-        return max(0, hours)
+        """Calculate hours until market opens (4:00 AM ET for pre-market start)."""
+        eastern = pytz.timezone('US/Eastern')
+        now_et = datetime.now(pytz.utc).astimezone(eastern)
+        market_open_et = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+        # If past 4:00 AM ET today, compute until tomorrow 4:00 AM
+        if now_et >= market_open_et:
+            market_open_et = market_open_et + timedelta(days=1)
+        hours = (market_open_et - now_et).total_seconds() / 3600
+        return max(0.0, hours)
     
     def _show_watchlist_status(self):
         """Show current watchlist status with details"""
