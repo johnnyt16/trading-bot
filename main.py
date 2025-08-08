@@ -7,6 +7,7 @@ import asyncio
 import sys
 from pathlib import Path
 from datetime import datetime
+import pytz
 sys.path.append(str(Path(__file__).parent))
 
 from src.ai_brain.gpt5_trading_system import GPT5TradingBrain
@@ -33,7 +34,9 @@ async def main():
         while True:
             # Check market status
             clock = brain.alpaca.get_clock()
-            current_time = datetime.now()
+            # Use Eastern timezone for consistency with market hours
+            eastern = pytz.timezone('US/Eastern')
+            current_time = datetime.now(eastern)
             current_hour = current_time.hour
             
             # Extended hours: 4 AM - 9:30 AM and 4 PM - 8 PM ET
@@ -43,7 +46,7 @@ async def main():
             
             if not clock.is_open and not is_extended:
                 next_open = clock.next_open.strftime('%Y-%m-%d %H:%M:%S ET')
-                hours_until_open = (clock.next_open - datetime.now()).total_seconds() / 3600
+                hours_until_open = (clock.next_open - current_time).total_seconds() / 3600
                 logger.info(f"Market closed. Opens in {hours_until_open:.1f} hours at {next_open}")
                 
                 # OVERNIGHT RESEARCH MODE - Build watchlist of 6 high-confidence stocks
@@ -63,12 +66,12 @@ async def main():
                         logger.info(f"   • {stock['symbol']}: {stock.get('confidence')}% - {stock.get('catalyst', 'N/A')[:40]}")
                 
                 # Learn from recent trades every hour
-                if datetime.now().minute < 10:
+                if current_time.minute < 10:
                     logger.info("📚 Analyzing recent performance...")
                     await brain.learn_and_adapt()
                 
                 # Reset morning trades flag when new day starts
-                if datetime.now().hour == 0:
+                if current_time.hour == 0:
                     morning_trades_executed = False
                 
                 # Wait longer during deep overnight (less frequent checks)
@@ -131,7 +134,7 @@ async def main():
             await brain.manage_positions()
             
             # Learn (every hour)
-            if datetime.now().minute == 0:
+            if current_time.minute == 0:
                 await brain.learn_and_adapt()
             
             # Wait 30 seconds before next scan
