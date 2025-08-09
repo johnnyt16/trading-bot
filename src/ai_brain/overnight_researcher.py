@@ -46,9 +46,10 @@ class OvernightResearcher:
         self.cycle_count += 1
         current_hour = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern')).hour
         
-        # Reset watchlist at midnight for new trading day
-        if current_hour == 0 and self.last_reset_hour != 0:
-            logger.info("🔄 Midnight reset - Starting fresh for new trading day")
+        # Reset watchlist at midnight on TRADING DAYS only (Mon–Fri) to avoid weekend churn
+        weekday = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern')).weekday()  # Mon=0..Sun=6
+        if current_hour == 0 and self.last_reset_hour != 0 and weekday <= 4:
+            logger.info("🔄 Midnight reset (weekday) - Starting fresh for new trading day")
             self.reset_for_new_day()
         self.last_reset_hour = current_hour
         
@@ -71,7 +72,34 @@ class OvernightResearcher:
         
         # Cost-aware overnight gating using explicit ET session windows
         session = self._session_window_et()
+        now_et = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern'))
+        weekday = now_et.weekday()
+        # Weekend smart gating: skip discovery on Sat entirely; on Sun only run once within 12h of premarket
+        is_weekend = weekday >= 5
+        hours_to_premarket = self._hours_until_market_open()
         if session == 'overnight':  # 20:00–04:00 ET
+            if is_weekend:
+                # Saturday: skip. Sunday: only run initial once if within 12h of Monday premarket
+                if weekday == 6 and hours_to_premarket <= 12 and not self._overnight_initial_done and len(self.watchlist) < self.max_watchlist_size:
+                    slots_available = self.max_watchlist_size - len(self.watchlist)
+                    logger.info(f"🔍 Sunday night initial discovery for {slots_available} slots (<=12h to premarket)")
+                    new_opportunities = await self._discover_opportunities()
+                    for opp in new_opportunities:
+                        symbol = opp['symbol']
+                        if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
+                            if not any(stock['symbol'] == symbol for stock in self.watchlist):
+                                if opp.get('confidence', 0) >= self.confidence_threshold:
+                                    opp['discovered_cycle'] = self.cycle_count
+                                    opp['research_depth'] = 1
+                                    self.watchlist.append(opp)
+                                    self.research_history[symbol] = 1
+                                    logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+                    self._overnight_initial_done = True
+                else:
+                    logger.info("🛌 Weekend overnight: skipping discovery to save credits")
+                # Do not continue into weekday overnight logic
+                session = 'weekend'
+            
             if not self._overnight_initial_done and len(self.watchlist) < self.max_watchlist_size:
                 slots_available = self.max_watchlist_size - len(self.watchlist)
                 logger.info(f"🔍 Overnight initial discovery for {slots_available} slots")

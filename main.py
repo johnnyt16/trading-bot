@@ -62,6 +62,17 @@ async def main():
                 hours_until_open = (next_open_dt - datetime.now(pytz.utc)).total_seconds() / 3600
                 logger.info(f"Market closed. Opens in {hours_until_open:.1f} hours at {next_open}")
                 
+                # Weekend smart gating to avoid unnecessary calls
+                weekday = current_time.weekday()  # Mon=0..Sun=6
+                if weekday == 5:  # Saturday
+                    logger.info("🛌 Weekend (Saturday): conserving credits; skipping overnight research")
+                    await asyncio.sleep(1800)  # 30m sleep
+                    continue
+                if weekday == 6 and hours_until_open > 12:  # Sunday >12h from premarket
+                    logger.info("🛌 Weekend (Sunday >12h to premarket): conserving credits; skipping cycles")
+                    await asyncio.sleep(1800)
+                    continue
+
                 # OVERNIGHT RESEARCH MODE - Build watchlist of 6 high-confidence stocks
                 logger.info("🌙 OVERNIGHT RESEARCH MODE - Building tomorrow's watchlist")
                 
