@@ -42,10 +42,12 @@ async def main():
             eastern = pytz.timezone('US/Eastern')
             current_time = datetime.now(pytz.utc).astimezone(eastern)
             current_hour = current_time.hour
+            weekday = current_time.weekday()  # Monday=0..Sunday=6
+            is_weekday = weekday < 5
             
-            # Extended hours: 4 AM - 9:30 AM and 4 PM - 8 PM ET
-            is_premarket = (current_hour >= 4 and current_hour < 9) or (current_hour == 9 and current_time.minute < 30)
-            is_afterhours = current_hour >= 16 and current_hour < 20
+            # Extended hours: 4 AM - 9:30 AM and 4 PM - 8 PM ET (weekdays only)
+            is_premarket = is_weekday and ((current_hour >= 4 and current_hour < 9) or (current_hour == 9 and current_time.minute < 30))
+            is_afterhours = is_weekday and (current_hour >= 16 and current_hour < 20)
             is_extended = is_premarket or is_afterhours
             
             if not clock.is_open and not is_extended:
@@ -160,23 +162,24 @@ async def main():
                     overnight_researcher.clear_watchlist()
             
             # Regular scanning for more opportunities (respect cost mode cadence)
-            logger.info("🔍 Scanning for opportunities...")
-            opportunities = await brain.autonomous_market_scan()
-            
-            # Analyze and trade top opportunities
-            for opp in opportunities[:3]:
-                analysis = await brain.deep_analysis(opp['symbol'])
+            if is_weekday:
+                logger.info("🔍 Scanning for opportunities...")
+                opportunities = await brain.autonomous_market_scan()
                 
-                if analysis['decision'] == 'GO':
-                    executed = await brain.execute_trade(analysis)
-                    if executed:
-                        position_manager.add_position(
-                            symbol=analysis['symbol'],
-                            entry_price=analysis['entry_price'],
-                            stop_loss=analysis['stop_loss'],
-                            take_profit=analysis['target_1'],
-                            strategy_type='standard'
-                        )
+                # Analyze and trade top opportunities
+                for opp in opportunities[:3]:
+                    analysis = await brain.deep_analysis(opp['symbol'])
+                    
+                    if analysis['decision'] == 'GO':
+                        executed = await brain.execute_trade(analysis)
+                        if executed:
+                            position_manager.add_position(
+                                symbol=analysis['symbol'],
+                                entry_price=analysis['entry_price'],
+                                stop_loss=analysis['stop_loss'],
+                                take_profit=analysis['target_1'],
+                                strategy_type='standard'
+                            )
             
             # Position management handled by PositionManager monitor task
             

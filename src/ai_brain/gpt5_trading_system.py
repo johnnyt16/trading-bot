@@ -5,6 +5,7 @@ Designed for OpenAI's most advanced model with web search and reasoning
 """
 
 import os
+import logging
 import asyncio
 import json
 import time
@@ -112,6 +113,11 @@ class DualBucketPerformanceTracker:
                 m['home_runs'] += 1
 
 load_dotenv()
+
+# Reduce noisy logs from third-party libs (e.g., yfinance weekend errors)
+logging.getLogger('yfinance').setLevel(logging.ERROR)
+logging.getLogger('yfinance.ticker').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 class GPT5TradingBrain:
     """
@@ -662,11 +668,23 @@ class GPT5TradingBrain:
         except Exception as e:
             logger.warning(f"Follow-up search generation failed: {e}")
         
+        # If we failed to gather any web intelligence, do not fabricate ideas
+        try:
+            total_search_results = sum(len(item.get('results', [])) for item in all_search_results)
+        except Exception:
+            total_search_results = 0
+        if total_search_results == 0:
+            logger.info("Skipping new opportunity search due to insufficient web intel (Tavily unavailable or no results). Managing existing positions only.")
+            # Cache empty result to respect scan cadence
+            self._last_market_scan_at = datetime.now()
+            self._last_market_scan_result = []
+            return []
+
         # Step 4: Get real-time data for hot symbols identified by GPT
         market_movers = []
         
         # Add GPT-identified hot symbols to check list
-        symbols_to_check = list(set(['NVDA', 'TSLA', 'AAPL', 'AMD', 'META', 'GOOGL', 'MSFT'] + hot_symbols[:5]))
+        symbols_to_check = list({s.upper() for s in hot_symbols[:5]})
         
         for symbol in symbols_to_check:
             try:
@@ -1343,6 +1361,10 @@ class GPT5TradingBrain:
         try:
             # Primary: Use Alpaca for real-time SPY data
             clock = self.alpaca.get_clock()
+            # Determine weekday to handle weekend data sources more conservatively
+            now_et = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern'))
+            weekday = now_et.weekday()  # Mon=0..Sun=6
+            is_weekend = weekday >= 5
             
             if clock.is_open:
                 # During market hours, get intraday data (use IEX feed, not SIP)
@@ -1366,20 +1388,25 @@ class GPT5TradingBrain:
                     data_source = 'alpaca'
                     
             # Get volatility indicator (VIXY as VIX proxy)
-            # Attempt to use ^VIX index from yfinance; fallback to VIXY ETF via Alpaca
+            # Weekends: avoid '^VIX' since many providers return empty; prefer VIXY snapshot or default
             try:
-                vix = yf.Ticker('^VIX')
-                vix_hist = vix.history(period='1d')
-                if not vix_hist.empty:
-                    vix_level = float(vix_hist['Close'].iloc[-1])
-                    logger.debug(f"VIX level from yfinance: {vix_level:.2f}")
-            except Exception as _:
-                try:
-                    vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
-                    if vixy_snapshot and vixy_snapshot.latest_trade:
-                        vix_level = float(vixy_snapshot.latest_trade.price)
-                except Exception:
-                    vix_level = 20.0
+                if not is_weekend:
+                    vix = yf.Ticker('^VIX')
+                    vix_hist = vix.history(period='1d')
+                    if not vix_hist.empty:
+                        vix_level = float(vix_hist['Close'].iloc[-1])
+                        logger.debug(f"VIX level from yfinance: {vix_level:.2f}")
+                if is_weekend or vix_level == 20.0:
+                    # Try VIXY snapshot as a proxy
+                    try:
+                        vixy_snapshot = self.alpaca.get_snapshot('VIXY', feed='iex')
+                        if vixy_snapshot and vixy_snapshot.latest_trade:
+                            vix_level = float(vixy_snapshot.latest_trade.price)
+                    except Exception:
+                        pass
+            except Exception:
+                # Fall back to default if all else fails
+                vix_level = vix_level or 20.0
                 
         except Exception as e:
             logger.warning(f"Alpaca data fetch failed: {e}")
