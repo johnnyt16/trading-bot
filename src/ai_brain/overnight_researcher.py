@@ -30,6 +30,14 @@ class OvernightResearcher:
         self.discovery_energy = 0.5  # Start with 50/50 balance
         self.removed_stocks = []  # Track what we've already rejected tonight
         
+        # NOTE: We run on ET (New York). Use Alpaca's market clock plus ET windows.
+        
+        # Cost-aware overnight scheduling: only two Tavily-driven passes overnight
+        # 1) Initial discovery to fill the list
+        # 2) Final validation before pre-market open (≤ 1h before 4:00 AM ET)
+        self._overnight_initial_done = False
+        self._overnight_final_done = False
+        
     async def overnight_research_cycle(self) -> List[Dict]:
         """
         Main overnight research cycle - builds on previous cycles
@@ -61,30 +69,52 @@ class OvernightResearcher:
         
         logger.info(f"⚖️ Research balance: {int(self.discovery_energy*100)}% discovery, {int((1-self.discovery_energy)*100)}% deepening")
         
-        # Step 1: Deepen existing watchlist (use portion of energy)
-        if self.watchlist and self.discovery_energy < 1.0:
-            logger.info(f"🔬 Deepening research on existing {len(self.watchlist)} stocks")
-            self.watchlist = await self._deep_research_watchlist()
-        
-        # Step 2: Discover new opportunities (use portion of energy)
-        if self.discovery_energy > 0 and len(self.watchlist) < self.max_watchlist_size:
-            slots_available = self.max_watchlist_size - len(self.watchlist)
-            logger.info(f"🔍 Searching for {slots_available} new opportunities")
-            
-            new_opportunities = await self._discover_opportunities()
-            
-            # Add new opportunities that aren't in removed list
-            for opp in new_opportunities:
-                symbol = opp['symbol']
-                if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
-                    # Check if already in watchlist
-                    if not any(stock['symbol'] == symbol for stock in self.watchlist):
-                        if opp.get('confidence', 0) >= self.confidence_threshold:
-                            opp['discovered_cycle'] = self.cycle_count
-                            opp['research_depth'] = 1
-                            self.watchlist.append(opp)
-                            self.research_history[symbol] = 1
-                            logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+        # Cost-aware overnight gating using explicit ET session windows
+        session = self._session_window_et()
+        if session == 'overnight':  # 20:00–04:00 ET
+            if not self._overnight_initial_done and len(self.watchlist) < self.max_watchlist_size:
+                slots_available = self.max_watchlist_size - len(self.watchlist)
+                logger.info(f"🔍 Overnight initial discovery for {slots_available} slots")
+                new_opportunities = await self._discover_opportunities()
+                for opp in new_opportunities:
+                    symbol = opp['symbol']
+                    if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
+                        if not any(stock['symbol'] == symbol for stock in self.watchlist):
+                            if opp.get('confidence', 0) >= self.confidence_threshold:
+                                opp['discovered_cycle'] = self.cycle_count
+                                opp['research_depth'] = 1
+                                self.watchlist.append(opp)
+                                self.research_history[symbol] = 1
+                                logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+                self._overnight_initial_done = True
+            else:
+                logger.info("⏸️ Skipping overnight searches (initial pass already done)")
+        elif session == 'pre':  # 04:00–09:30 ET
+            if not self._overnight_final_done:
+                if self.watchlist:
+                    logger.info(f"🔬 Final validation on {len(self.watchlist)} watchlist stocks before premarket")
+                    self.watchlist = await self._deep_research_watchlist()
+                if len(self.watchlist) < self.max_watchlist_size:
+                    slots_available = self.max_watchlist_size - len(self.watchlist)
+                    logger.info(f"🔍 Final backfill discovery for {slots_available} slots")
+                    new_opportunities = await self._discover_opportunities()
+                    for opp in new_opportunities:
+                        symbol = opp['symbol']
+                        if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
+                            if not any(stock['symbol'] == symbol for stock in self.watchlist):
+                                if opp.get('confidence', 0) >= self.confidence_threshold:
+                                    opp['discovered_cycle'] = self.cycle_count
+                                    opp['research_depth'] = 1
+                                    self.watchlist.append(opp)
+                                    self.research_history[symbol] = 1
+                                    logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+                self._overnight_final_done = True
+            else:
+                logger.info("⏸️ Skipping final validation (already completed)")
+        else:
+            # Regular/post sessions – avoid overnight searches
+            if self.watchlist:
+                logger.debug("Daytime/post: maintaining watchlist without additional overnight searches")
         
         # Step 3: Optimize - remove low confidence, keep building toward 6
         self.watchlist = await self._optimize_watchlist()
@@ -188,7 +218,7 @@ class OvernightResearcher:
             
             try:
                 # Search for latest updates on this stock
-                latest_search = self.brain.tavily.search(
+                latest_search = await self.brain._safe_tavily_search(
                     f"{symbol} stock latest news after hours {datetime.now().strftime('%B %d')}",
                     max_results=3
                 )
@@ -264,6 +294,10 @@ class OvernightResearcher:
             # Look for one more opportunity
             new_opportunities = await self._discover_opportunities()
             for opp in new_opportunities:
+                # Skip if symbol already in watchlist (prevent duplicates)
+                if any(stock['symbol'] == opp['symbol'] for stock in self.watchlist):
+                    continue
+                    
                 if len(self.watchlist) < self.max_watchlist_size:
                     # Check if it's better than our worst stock
                     if self.watchlist and opp.get('confidence', 0) > self.watchlist[-1].get('confidence', 0):
@@ -277,15 +311,26 @@ class OvernightResearcher:
         return self.watchlist
     
     def _hours_until_market_open(self) -> float:
-        """Calculate hours until market opens (4:00 AM ET for pre-market start)."""
+        """Hours until next premarket start (04:00 ET). For info only, not gating logic."""
         eastern = pytz.timezone('US/Eastern')
         now_et = datetime.now(pytz.utc).astimezone(eastern)
-        market_open_et = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
-        # If past 4:00 AM ET today, compute until tomorrow 4:00 AM
-        if now_et >= market_open_et:
-            market_open_et = market_open_et + timedelta(days=1)
-        hours = (market_open_et - now_et).total_seconds() / 3600
-        return max(0.0, hours)
+        next_open = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+        if now_et >= next_open:
+            next_open = next_open + timedelta(days=1)
+        return max(0.0, (next_open - now_et).total_seconds() / 3600)
+
+    def _session_window_et(self) -> str:
+        """Return 'overnight' (20:00–04:00), 'pre' (04:00–09:30), 'regular' (09:30–16:00), 'post' (16:00–20:00)."""
+        eastern = pytz.timezone('US/Eastern')
+        now_et = datetime.now(pytz.utc).astimezone(eastern)
+        hm = now_et.hour + now_et.minute / 60.0
+        if hm >= 20.0 or hm < 4.0:
+            return 'overnight'
+        if 4.0 <= hm < 9.5:
+            return 'pre'
+        if 9.5 <= hm < 16.0:
+            return 'regular'
+        return 'post'
     
     def _show_watchlist_status(self):
         """Show current watchlist status with details"""
@@ -365,6 +410,8 @@ class OvernightResearcher:
         self.removed_stocks = []
         self.cycle_count = 0
         self.discovery_energy = 0.5
+        self._overnight_initial_done = False
+        self._overnight_final_done = False
         logger.info("🔄 Reset for new trading day - starting fresh")
     
     def clear_watchlist(self):
