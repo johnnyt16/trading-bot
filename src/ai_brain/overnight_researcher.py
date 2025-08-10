@@ -97,26 +97,26 @@ class OvernightResearcher:
                     self._overnight_initial_done = True
                 else:
                     logger.info("🛌 Weekend overnight: skipping discovery to save credits")
-                # Do not continue into weekday overnight logic
-                session = 'weekend'
-            
-            if not self._overnight_initial_done and len(self.watchlist) < self.max_watchlist_size:
-                slots_available = self.max_watchlist_size - len(self.watchlist)
-                logger.info(f"🔍 Overnight initial discovery for {slots_available} slots")
-                new_opportunities = await self._discover_opportunities()
-                for opp in new_opportunities:
-                    symbol = opp['symbol']
-                    if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
-                        if not any(stock['symbol'] == symbol for stock in self.watchlist):
-                            if opp.get('confidence', 0) >= self.confidence_threshold:
-                                opp['discovered_cycle'] = self.cycle_count
-                                opp['research_depth'] = 1
-                                self.watchlist.append(opp)
-                                self.research_history[symbol] = 1
-                                logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
-                self._overnight_initial_done = True
+                # Explicitly skip weekday-overnight logic on weekends
+                pass
             else:
-                logger.info("⏸️ Skipping overnight searches (initial pass already done)")
+                if not self._overnight_initial_done and len(self.watchlist) < self.max_watchlist_size:
+                    slots_available = self.max_watchlist_size - len(self.watchlist)
+                    logger.info(f"🔍 Overnight initial discovery for {slots_available} slots")
+                    new_opportunities = await self._discover_opportunities()
+                    for opp in new_opportunities:
+                        symbol = opp['symbol']
+                        if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
+                            if not any(stock['symbol'] == symbol for stock in self.watchlist):
+                                if opp.get('confidence', 0) >= self.confidence_threshold:
+                                    opp['discovered_cycle'] = self.cycle_count
+                                    opp['research_depth'] = 1
+                                    self.watchlist.append(opp)
+                                    self.research_history[symbol] = 1
+                                    logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+                    self._overnight_initial_done = True
+                else:
+                    logger.info("⏸️ Skipping overnight searches (initial pass already done)")
         elif session == 'pre':  # 04:00–09:30 ET
             if not self._overnight_final_done:
                 if self.watchlist:

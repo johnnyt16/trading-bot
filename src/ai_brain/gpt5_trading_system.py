@@ -179,6 +179,7 @@ class GPT5TradingBrain:
         # Cost-aware Tavily controls
         # ~$20/month at $0.008/credit ≈ 2,500 credits/month → ~80/day (default, override via env)
         self.tavily_daily_credit_budget = int(os.getenv('TAVILY_DAILY_CREDIT_BUDGET', '80'))
+        self.tavily_weekly_credit_budget = int(os.getenv('TAVILY_WEEKLY_CREDIT_BUDGET', '200'))
         self.tavily_max_results = int(os.getenv('TAVILY_MAX_RESULTS', '2'))
         self.tavily_symbol_cooldown_minutes = int(os.getenv('TAVILY_SYMBOL_COOLDOWN_MINUTES', '120'))
         include_domains_env = os.getenv('TAVILY_INCLUDE_DOMAINS', '')
@@ -188,9 +189,12 @@ class GPT5TradingBrain:
             self.tavily_include_domains = [
                 "reuters.com", "bloomberg.com", "cnbc.com", "marketwatch.com", "seekingalpha.com"
             ]
-        # Daily usage accounting
+        # Daily/weekly usage accounting
         self._tavily_credits_today: int = 0
         self._tavily_last_reset_date = datetime.now().date()
+        self._tavily_credits_this_week: int = 0
+        today = datetime.now().date()
+        self._tavily_week_start_date = today - timedelta(days=today.weekday())
         self._tavily_last_search_for_symbol: Dict[str, datetime] = {}
         # Credit buckets (premarket/intraday/buffer)
         self._init_tavily_buckets()
@@ -340,16 +344,28 @@ class GPT5TradingBrain:
             logger.debug("Tavily in fallback mode (usage limit exceeded), skipping search")
             return {'results': [], 'error': 'fallback_mode'}
 
-        # Reset daily counters at midnight
+        # Reset daily/weekly counters at midnight and weekly on Monday
         today = datetime.now().date()
         if self._tavily_last_reset_date != today:
             self._tavily_last_reset_date = today
             self._tavily_credits_today = 0
             self._tavily_last_search_for_symbol = {}
+        # Weekly reset (Monday)
+        try:
+            current_week_start = today - timedelta(days=today.weekday())
+            if getattr(self, '_tavily_week_start_date', current_week_start) != current_week_start:
+                self._tavily_week_start_date = current_week_start
+                self._tavily_credits_this_week = 0
+        except Exception:
+            pass
 
-        # Enforce daily credit budget
-        if self._tavily_credits_today >= self.tavily_daily_credit_budget or not self._check_tavily_bucket_allowance():
-            logger.info("Tavily daily credit budget reached, skipping search")
+        # Enforce daily and weekly credit budgets
+        if (
+            self._tavily_credits_today >= self.tavily_daily_credit_budget
+            or getattr(self, '_tavily_credits_this_week', 0) >= getattr(self, 'tavily_weekly_credit_budget', 10**9)
+            or not self._check_tavily_bucket_allowance()
+        ): 
+            logger.info("Tavily credit budget reached (daily/weekly), skipping search")
             return {'results': [], 'error': 'daily_budget_exhausted'}
 
         # Per-symbol cooldown (if symbol present in query)
@@ -391,8 +407,9 @@ class GPT5TradingBrain:
         # Record this request time
         self._tavily_request_times.append(time.time())
         
-        # Attempt the search with retries
-        for attempt in range(max_retries):
+        # Attempt the search with retries (fewer in low-cost mode)
+        effective_max_retries = 1 if self.cost_mode == 'low' else min(max_retries, 2)
+        for attempt in range(effective_max_retries):
             try:
                 logger.debug(f"Tavily search (attempt {attempt + 1}): {query[:50]}...")
                 
@@ -410,6 +427,10 @@ class GPT5TradingBrain:
                 logger.debug(f"Tavily search successful, got {len(result.get('results', []))} results")
                 # Account for credits: basic search = 1 credit
                 self._tavily_credits_today += 1
+                try:
+                    self._tavily_credits_this_week += 1
+                except Exception:
+                    pass
                 self._consume_tavily_bucket_credit()
                 if symbol_in_query:
                     self._tavily_last_search_for_symbol[symbol_in_query] = datetime.now()
@@ -476,6 +497,14 @@ class GPT5TradingBrain:
         clock = self.alpaca.get_clock()
         is_market_closed = not bool(getattr(clock, 'is_open', False))
         research_mode = research_mode or is_market_closed
+
+        # Skip scans on weekends unless explicitly requested via research_mode
+        now_et = datetime.now(pytz.utc).astimezone(pytz.timezone('US/Eastern'))
+        if now_et.weekday() >= 5 and not research_mode:
+            self._last_market_scan_at = datetime.now()
+            self._last_market_scan_result = []
+            logger.info("Weekend detected. Skipping market scan to conserve credits.")
+            return []
         
         # Step 1: Let GPT generate intelligent search queries based on market conditions
         mode_context = "RESEARCH MODE - Preparing for next trading session" if research_mode else "LIVE TRADING MODE"
@@ -580,7 +609,8 @@ class GPT5TradingBrain:
         # Step 2: Execute the searches (including social media)
         all_search_results = []
         # Reduce default query count in low-cost mode
-        max_queries = 2 if self.cost_mode == 'low' else 4 if self.cost_mode == 'medium' else 6
+        # Reduce Tavily usage further in low-cost mode
+        max_queries = 1 if self.cost_mode == 'low' else 3 if self.cost_mode == 'medium' else 6
         for search_item in searches[:max_queries]:
             query = search_item.get('query', search_item) if isinstance(search_item, dict) else search_item
             try:
