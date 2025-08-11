@@ -91,8 +91,8 @@ async def main():
                     for stock in watchlist[:3]:
                         logger.info(f"   • {stock['symbol']}: {stock.get('confidence')}% - {stock.get('catalyst', 'N/A')[:40]}")
                 
-                # Learn from recent trades every hour
-                if current_time.minute < 10:
+                # Learn from recent trades every hour (weekdays only to avoid weekend GPT calls)
+                if is_weekday and current_time.minute < 10:
                     logger.info("📚 Analyzing recent performance...")
                     await brain.learn_and_adapt()
                 
@@ -183,8 +183,8 @@ async def main():
             
             # Position management handled by PositionManager monitor task
             
-            # Learn (every hour)
-            if current_time.minute == 0:
+            # Learn (every hour on weekdays)
+            if is_weekday and current_time.minute == 0:
                 await brain.learn_and_adapt()
             
             # Adjust loop sleep by cost mode and session

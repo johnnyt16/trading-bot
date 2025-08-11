@@ -22,7 +22,8 @@ class Config:
     TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.05))
     MIN_CONFIDENCE_SCORE = float(os.getenv("MIN_CONFIDENCE_SCORE", 0.6))
     
-    WATCHLIST = os.getenv("WATCHLIST", "TSLA,NVDA,AMD").split(",")
+    # Default to an empty watchlist unless explicitly provided via env
+    WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "").split(",") if s.strip()]
 
 def get_alpaca_client():
     try:

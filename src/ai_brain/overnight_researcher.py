@@ -174,7 +174,6 @@ class OvernightResearcher:
         
         Focus on:
         - HIGH PROBABILITY moves (not speculation)
-        - LIQUID stocks (no penny stocks)
         - CLEAR CATALYSTS within 24 hours
         - Risk/reward > 1:3
         
@@ -315,26 +314,12 @@ class OvernightResearcher:
             for stock in removed:
                 logger.info(f"  Removed {stock['symbol']} from watchlist (lower priority)")
         
-        # If we have less than 6, try to find more
+        # If we have less than 6, do NOT trigger additional discovery here to conserve credits.
+        # Discovery occurs only during the explicit overnight initial/final phases.
         if len(self.watchlist) < self.max_watchlist_size:
-            logger.info(f"  Watchlist has {len(self.watchlist)}/{self.max_watchlist_size} - seeking more opportunities")
-            
-            # Look for one more opportunity
-            new_opportunities = await self._discover_opportunities()
-            for opp in new_opportunities:
-                # Skip if symbol already in watchlist (prevent duplicates)
-                if any(stock['symbol'] == opp['symbol'] for stock in self.watchlist):
-                    continue
-                    
-                if len(self.watchlist) < self.max_watchlist_size:
-                    # Check if it's better than our worst stock
-                    if self.watchlist and opp.get('confidence', 0) > self.watchlist[-1].get('confidence', 0):
-                        # Replace the worst one
-                        logger.info(f"  Replacing {self.watchlist[-1]['symbol']} with {opp['symbol']}")
-                        self.watchlist[-1] = opp
-                        self.watchlist.sort(key=lambda x: x.get('confidence', 0), reverse=True)
-                    elif len(self.watchlist) < self.max_watchlist_size:
-                        self.watchlist.append(opp)
+            logger.debug(
+                f"  Watchlist has {len(self.watchlist)}/{self.max_watchlist_size} - holding; no extra discovery outside scheduled passes"
+            )
         
         return self.watchlist
     
