@@ -118,27 +118,15 @@ class OvernightResearcher:
                 else:
                     logger.info("⏸️ Skipping overnight searches (initial pass already done)")
         elif session == 'pre':  # 04:00–09:30 ET
+            # To respect daily GPT/Tavily cycle limits, avoid extra discovery/validation here.
             if not self._overnight_final_done:
                 if self.watchlist:
-                    logger.info(f"🔬 Final validation on {len(self.watchlist)} watchlist stocks before premarket")
-                    self.watchlist = await self._deep_research_watchlist()
-                if len(self.watchlist) < self.max_watchlist_size:
-                    slots_available = self.max_watchlist_size - len(self.watchlist)
-                    logger.info(f"🔍 Final backfill discovery for {slots_available} slots")
-                    new_opportunities = await self._discover_opportunities()
-                    for opp in new_opportunities:
-                        symbol = opp['symbol']
-                        if symbol not in self.removed_stocks and len(self.watchlist) < self.max_watchlist_size:
-                            if not any(stock['symbol'] == symbol for stock in self.watchlist):
-                                if opp.get('confidence', 0) >= self.confidence_threshold:
-                                    opp['discovered_cycle'] = self.cycle_count
-                                    opp['research_depth'] = 1
-                                    self.watchlist.append(opp)
-                                    self.research_history[symbol] = 1
-                                    logger.info(f"✅ Added {symbol} to watchlist (Confidence: {opp['confidence']}%)")
+                    logger.info("🔒 Finalizing overnight watchlist (no additional discovery in premarket)")
+                else:
+                    logger.warning("⚠️ No overnight watchlist built; will proceed without premarket additions")
                 self._overnight_final_done = True
             else:
-                logger.info("⏸️ Skipping final validation (already completed)")
+                logger.debug("Premarket: watchlist already finalized")
         else:
             # Regular/post sessions – avoid overnight searches
             if self.watchlist:
@@ -181,7 +169,7 @@ class OvernightResearcher:
         """
         
         # Use the brain's market scan in research mode
-        opportunities = await self.brain.autonomous_market_scan(research_mode=True)
+        opportunities = await self.brain.autonomous_market_scan(research_mode=True, deep_cycle=True)
         
         # Filter for high confidence only
         filtered = [opp for opp in opportunities if opp.get('confidence', 0) >= self.confidence_threshold]

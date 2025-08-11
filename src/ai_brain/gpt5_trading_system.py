@@ -177,8 +177,8 @@ class GPT5TradingBrain:
         self._tavily_fallback_mode = False  # Enable fallback mode when API is unavailable
         
         # Cost-aware Tavily controls
-        # ~$20/month at $0.008/credit ≈ 2,500 credits/month → ~80/day (default, override via env)
-        self.tavily_daily_credit_budget = int(os.getenv('TAVILY_DAILY_CREDIT_BUDGET', '80'))
+        # Default to 40/day per user budget; override via env if needed
+        self.tavily_daily_credit_budget = int(os.getenv('TAVILY_DAILY_CREDIT_BUDGET', '40'))
         self.tavily_weekly_credit_budget = int(os.getenv('TAVILY_WEEKLY_CREDIT_BUDGET', '200'))
         self.tavily_max_results = int(os.getenv('TAVILY_MAX_RESULTS', '2'))
         self.tavily_symbol_cooldown_minutes = int(os.getenv('TAVILY_SYMBOL_COOLDOWN_MINUTES', '120'))
@@ -476,7 +476,7 @@ class GPT5TradingBrain:
         # If all retries failed
         return {'results': [], 'error': 'max_retries_exceeded'}
     
-    async def autonomous_market_scan(self, research_mode: bool = False) -> List[Dict]:
+    async def autonomous_market_scan(self, research_mode: bool = False, deep_cycle: bool = False) -> List[Dict]:
         """
         GPT-5 scans the entire market using dynamic, intelligent search
         GPT generates its own search queries based on reasoning and market conditions
@@ -568,25 +568,21 @@ class GPT5TradingBrain:
         Be creative and think deeply. What would give us an edge TODAY specifically?
         """
         
-        use_dynamic_searches = self.cost_mode != 'low'
         try:
-            if use_dynamic_searches:
-                # GPT generates intelligent searches (skipped in low-cost mode)
-                response = await self._make_gpt_request(
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": search_generation_prompt}
-                    ],
-                    temperature=0.5,  # More creative for search generation
-                    max_tokens=600
-                )
-                search_data = self._parse_json_response(response.choices[0].message.content)
-                searches = search_data.get('searches', [])
-                logger.info(f"GPT generated {len(searches)} intelligent searches")
-            else:
-                raise Exception("Low-cost mode: skipping GPT search generation")
+            # Always allow GPT to generate searches, but control depth by mode
+            response = await self._make_gpt_request(
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": search_generation_prompt}
+                ],
+                temperature=0.5,
+                max_tokens=450 if self.cost_mode == 'low' else 600
+            )
+            search_data = self._parse_json_response(response.choices[0].message.content)
+            searches = search_data.get('searches', [])
+            logger.info(f"GPT generated {len(searches)} intelligent searches")
         except Exception as e:
-            logger.info(f"Using default searches ({e})")
+            logger.info(f"Using default searches (fallback: {e})")
             searches = [
                 {"query": f"reddit wallstreetbets trending stocks {datetime.now().strftime('%B %d')} sentiment", "purpose": "Social sentiment"},
                 {"query": f"unusual options activity call sweeps {datetime.now().strftime('%B %d')}", "purpose": "Smart money flow"},
@@ -608,9 +604,11 @@ class GPT5TradingBrain:
 
         # Step 2: Execute the searches (including social media)
         all_search_results = []
-        # Reduce default query count in low-cost mode
-        # Reduce Tavily usage further in low-cost mode
-        max_queries = 1 if self.cost_mode == 'low' else 3 if self.cost_mode == 'medium' else 6
+        # Query count controlled by deep_cycle and cost mode
+        if deep_cycle:
+            max_queries = 6 if self.cost_mode == 'low' else 8 if self.cost_mode == 'medium' else 10
+        else:
+            max_queries = 2 if self.cost_mode == 'low' else 3 if self.cost_mode == 'medium' else 4
         for search_item in searches[:max_queries]:
             query = search_item.get('query', search_item) if isinstance(search_item, dict) else search_item
             try:
@@ -663,37 +661,38 @@ class GPT5TradingBrain:
         }}
         """
         
-        # Let GPT reason about initial findings and search deeper (skip in low-cost mode)
+        # Let GPT reason about initial findings and search deeper
         follow_up_searches = []
         hot_symbols = []
         try:
-            if self.cost_mode != 'low':
-                response = await self._make_gpt_request(
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": initial_analysis_prompt}
-                    ],
-                    temperature=0.4,
-                    max_tokens=600
-                )
-                follow_up_data = self._parse_json_response(response.choices[0].message.content)
-                follow_up_searches = follow_up_data.get('follow_up_searches', [])
-                hot_symbols = follow_up_data.get('hot_symbols', [])
-                insights = follow_up_data.get('insights', '')
+            response = await self._make_gpt_request(
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": initial_analysis_prompt}
+                ],
+                temperature=0.4,
+                max_tokens=450 if self.cost_mode == 'low' else 600
+            )
+            follow_up_data = self._parse_json_response(response.choices[0].message.content)
+            follow_up_searches = follow_up_data.get('follow_up_searches', [])
+            hot_symbols = follow_up_data.get('hot_symbols', [])
+            insights = follow_up_data.get('insights', '')
+            if insights:
                 logger.info(f"GPT insights: {insights[:200]}")
-                # Execute follow-up searches
-                for follow_up in follow_up_searches[:1]:  # limit follow-ups in cost-aware mode
-                    query = follow_up.get('query', follow_up) if isinstance(follow_up, dict) else follow_up
-                    try:
-                        logger.debug(f"Follow-up search: {query}")
-                        results = await self._safe_tavily_search(query, max_results=self.tavily_max_results)
-                        all_search_results.append({
-                            'query': query,
-                            'purpose': f"FOLLOW-UP: {follow_up.get('reason', '')}",
-                            'results': results.get('results', [])
-                        })
-                    except:
-                        pass
+            # Execute follow-up searches (controlled by mode + deep_cycle)
+            follow_up_limit = (2 if self.cost_mode == 'low' else 3) if deep_cycle else 1
+            for follow_up in follow_up_searches[:follow_up_limit]:
+                query = follow_up.get('query', follow_up) if isinstance(follow_up, dict) else follow_up
+                try:
+                    logger.debug(f"Follow-up search: {query}")
+                    results = await self._safe_tavily_search(query, max_results=self.tavily_max_results)
+                    all_search_results.append({
+                        'query': query,
+                        'purpose': f"FOLLOW-UP: {follow_up.get('reason', '')}",
+                        'results': results.get('results', [])
+                    })
+                except:
+                    pass
                     
         except Exception as e:
             logger.warning(f"Follow-up search generation failed: {e}")
@@ -1454,7 +1453,7 @@ class GPT5TradingBrain:
                 logger.warning("Both data sources failed, using defaults")
         
         return {
-            'market_status': 'open' if clock and clock.is_open else 'closed',
+            'market_status': 'open' if clock and getattr(clock, 'is_open', False) else 'closed',
             'spy_change': round(spy_change, 2),
             'vix_level': round(vix_level, 2),
             'data_source': data_source

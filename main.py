@@ -33,6 +33,9 @@ async def main():
         
         # Track if we've already executed morning trades
         morning_trades_executed = False
+        # Track scheduled deep GPT/Tavily cycles (4 per weekday)
+        last_deep_cycle_date = None
+        deep_cycles_done = set()
         
         # The main trading loop
         while True:
@@ -109,30 +112,16 @@ async def main():
             if is_premarket:
                 logger.info("🌅 PRE-MARKET TRADING (4 AM - 9:30 AM ET)")
                 logger.info("Prime time for news reactions and gap plays!")
-                
-                # Execute watchlist trades at pre-market open (4 AM) if we have them
-                if not morning_trades_executed and current_hour == 4 and overnight_researcher.watchlist:
-                    logger.info("🚀 EXECUTING OVERNIGHT WATCHLIST - Top opportunities from research")
-                    top_opportunities = overnight_researcher.get_top_opportunities(3)  # Execute top 3
-                    
-                    for opp in top_opportunities:
-                        logger.info(f"Analyzing watchlist stock: {opp['symbol']}")
-                        analysis = await brain.deep_analysis(opp['symbol'])
-                        
-                        if analysis['decision'] == 'GO':
-                            executed = await brain.execute_trade(analysis)
-                            if executed:
-                                position_manager.add_position(
-                                    symbol=analysis['symbol'],
-                                    entry_price=analysis['entry_price'],
-                                    stop_loss=analysis['stop_loss'],
-                                    take_profit=analysis['target_1'],
-                                    strategy_type='standard'
-                                )
-                            morning_trades_executed = True
-                    
-                    # Clear watchlist after execution
-                    overnight_researcher.clear_watchlist()
+                # 1) Premarket deep cycle once around 07:30 ET
+                cycle_key_date = current_time.date()
+                if last_deep_cycle_date != cycle_key_date:
+                    last_deep_cycle_date = cycle_key_date
+                    deep_cycles_done = set()
+                if ((current_hour == 7 and current_time.minute >= 30) or (current_hour == 8)) and 'premarket' not in deep_cycles_done:
+                    logger.info("🔎 Premarket deep cycle (GPT+Tavily)")
+                    _ = await brain.autonomous_market_scan(research_mode=True, deep_cycle=True)
+                    deep_cycles_done.add('premarket')
+
                     
             elif is_afterhours:
                 logger.info("🌙 AFTER-HOURS TRADING (4 PM - 8 PM ET)")
@@ -161,25 +150,18 @@ async def main():
                     
                     overnight_researcher.clear_watchlist()
             
-            # Regular scanning for more opportunities (respect cost mode cadence)
-            if is_weekday:
-                logger.info("🔍 Scanning for opportunities...")
-                opportunities = await brain.autonomous_market_scan()
-                
-                # Analyze and trade top opportunities
-                for opp in opportunities[:3]:
-                    analysis = await brain.deep_analysis(opp['symbol'])
-                    
-                    if analysis['decision'] == 'GO':
-                        executed = await brain.execute_trade(analysis)
-                        if executed:
-                            position_manager.add_position(
-                                symbol=analysis['symbol'],
-                                entry_price=analysis['entry_price'],
-                                stop_loss=analysis['stop_loss'],
-                                take_profit=analysis['target_1'],
-                                strategy_type='standard'
-                            )
+            # Scheduled limited deep cycles (no continuous GPT/Tavily scans)
+            if is_weekday and clock.is_open:
+                # 2) Midday deep cycle ~12:00 ET
+                if current_hour == 12 and 'midday' not in deep_cycles_done:
+                    logger.info("🔎 Midday deep cycle (GPT+Tavily)")
+                    _ = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    deep_cycles_done.add('midday')
+                # 3) Power hour deep cycle ~15:00 ET
+                if current_hour == 15 and 'power_hour' not in deep_cycles_done:
+                    logger.info("🔎 Power hour deep cycle (GPT+Tavily)")
+                    _ = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    deep_cycles_done.add('power_hour')
             
             # Position management handled by PositionManager monitor task
             
@@ -187,14 +169,18 @@ async def main():
             if is_weekday and current_time.minute == 0:
                 await brain.learn_and_adapt()
             
-            # Adjust loop sleep by cost mode and session
-            cost_mode = os.getenv('COST_MODE', 'low').lower()
+            # 4) After-hours deep cycle once at ~16:15 ET
+            if is_afterhours:
+                if current_hour == 16 and current_time.minute >= 15 and 'afterhours' not in deep_cycles_done:
+                    logger.info("🔎 After-hours deep cycle (GPT+Tavily)")
+                    _ = await brain.autonomous_market_scan(research_mode=True, deep_cycle=True)
+                    deep_cycles_done.add('afterhours')
+
+            # Adjust loop sleep; avoid hammering
             if is_premarket or clock.is_open:
-                # During active sessions, still avoid hammering
-                sleep_seconds = 60 if cost_mode == 'low' else 45 if cost_mode == 'medium' else 30
+                await asyncio.sleep(60)
             else:
-                sleep_seconds = 300 if cost_mode == 'low' else 180 if cost_mode == 'medium' else 120
-            await asyncio.sleep(sleep_seconds)
+                await asyncio.sleep(300)
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")
