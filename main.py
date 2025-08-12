@@ -119,7 +119,23 @@ async def main():
                     deep_cycles_done = set()
                 if ((current_hour == 7 and current_time.minute >= 30) or (current_hour == 8)) and 'premarket' not in deep_cycles_done:
                     logger.info("🔎 Premarket deep cycle (GPT+Tavily)")
-                    _ = await brain.autonomous_market_scan(research_mode=True, deep_cycle=True)
+                    pre_opps = await brain.autonomous_market_scan(research_mode=True, deep_cycle=True)
+                    # Optionally execute a small number of high-confidence premarket plays
+                    for opp in (pre_opps or [])[:2]:  # be conservative premarket
+                        try:
+                            analysis = await brain.deep_analysis(opp['symbol'])
+                            if analysis.get('decision') == 'GO':
+                                executed = await brain.execute_trade(analysis)
+                                if executed:
+                                    position_manager.add_position(
+                                        symbol=analysis['symbol'],
+                                        entry_price=analysis['entry_price'],
+                                        stop_loss=analysis['stop_loss'],
+                                        take_profit=analysis['target_1'],
+                                        strategy_type='standard'
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Premarket execution skipped for {opp.get('symbol')}: {e}")
                     deep_cycles_done.add('premarket')
 
                     
@@ -134,6 +150,7 @@ async def main():
                     logger.info("🔔 MARKET OPEN - Executing overnight watchlist")
                     top_opportunities = overnight_researcher.get_top_opportunities(3)
                     
+                    any_executed = False
                     for opp in top_opportunities:
                         analysis = await brain.deep_analysis(opp['symbol'])
                         if analysis['decision'] == 'GO':
@@ -146,8 +163,10 @@ async def main():
                                     take_profit=analysis['target_1'],
                                     strategy_type='standard'
                                 )
-                            morning_trades_executed = True
+                                any_executed = True
                     
+                    if any_executed:
+                        morning_trades_executed = True
                     overnight_researcher.clear_watchlist()
             
             # Scheduled limited deep cycles (no continuous GPT/Tavily scans)
@@ -155,12 +174,43 @@ async def main():
                 # 2) Midday deep cycle ~12:00 ET
                 if current_hour == 12 and 'midday' not in deep_cycles_done:
                     logger.info("🔎 Midday deep cycle (GPT+Tavily)")
-                    _ = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    mid_opps = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    # Attempt executions for top validated symbols at midday
+                    for opp in (mid_opps or [])[:3]:
+                        try:
+                            analysis = await brain.deep_analysis(opp['symbol'])
+                            if analysis.get('decision') == 'GO':
+                                executed = await brain.execute_trade(analysis)
+                                if executed:
+                                    position_manager.add_position(
+                                        symbol=analysis['symbol'],
+                                        entry_price=analysis['entry_price'],
+                                        stop_loss=analysis['stop_loss'],
+                                        take_profit=analysis['target_1'],
+                                        strategy_type='standard'
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Midday execution skipped for {opp.get('symbol')}: {e}")
                     deep_cycles_done.add('midday')
                 # 3) Power hour deep cycle ~15:00 ET
                 if current_hour == 15 and 'power_hour' not in deep_cycles_done:
                     logger.info("🔎 Power hour deep cycle (GPT+Tavily)")
-                    _ = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    pwr_opps = await brain.autonomous_market_scan(research_mode=False, deep_cycle=True)
+                    for opp in (pwr_opps or [])[:3]:
+                        try:
+                            analysis = await brain.deep_analysis(opp['symbol'])
+                            if analysis.get('decision') == 'GO':
+                                executed = await brain.execute_trade(analysis)
+                                if executed:
+                                    position_manager.add_position(
+                                        symbol=analysis['symbol'],
+                                        entry_price=analysis['entry_price'],
+                                        stop_loss=analysis['stop_loss'],
+                                        take_profit=analysis['target_1'],
+                                        strategy_type='standard'
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Power hour execution skipped for {opp.get('symbol')}: {e}")
                     deep_cycles_done.add('power_hour')
             
             # Position management handled by PositionManager monitor task

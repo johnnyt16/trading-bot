@@ -828,15 +828,54 @@ class GPT5TradingBrain:
             
             # Validate and enhance opportunities with real-time data
             validated_opportunities = []
+            # Trading filters (env-configurable)
+            min_trade_price = float(os.getenv('MIN_TRADE_PRICE', '1'))
+            max_trade_price = float(os.getenv('MAX_TRADE_PRICE', '100'))
+            min_target_move_pct = float(os.getenv('MIN_TARGET_MOVE_PCT', '8'))
+            # Momentum threshold (allow big caps if score strong)
+            min_momentum_score = float(os.getenv('MIN_MOMENTUM_SCORE', '60'))
+            def _momentum_score(o: Dict) -> float:
+                # Composite score 0-100 from catalyst strength proxies
+                score = 0.0
+                # Target move (0-40)
+                score += max(0.0, min(40.0, float(o.get('target_move', 0)) * 2.5))
+                # Confidence (0-25)
+                score += max(0.0, min(25.0, float(o.get('confidence', 0)) * 0.25))
+                # Time urgency (0-15): sooner is better
+                hours = max(1, int(o.get('time_hours', 24)))
+                score += max(0.0, min(15.0, (24.0 / hours) * 3.0))
+                # Catalyst quality (0-15)
+                catalyst = str(o.get('catalyst', '')).lower()
+                if any(k in catalyst for k in ['fda', 'pdufa', 'approval']):
+                    score += 12
+                elif any(k in catalyst for k in ['earnings', 'guidance', 'beat', 'raise']):
+                    score += 10
+                elif any(k in catalyst for k in ['upgrade', 'm&a', 'acquisition', 'takeover']):
+                    score += 8
+                # Social sentiment (0-5)
+                social = str(o.get('social_sentiment', '')).lower()
+                if any(k in social for k in ['trending', 'surge', 'wsb', 'reddit', 'twitter', 'stocktwits']):
+                    score += 5
+                return max(0.0, min(100.0, score))
+
             for opp in opportunities:
                 try:
                     # Get real-time price for validation
                     snapshot = self.alpaca.get_snapshot(opp['symbol'], feed='iex')
                     if snapshot and snapshot.latest_trade:
-                        opp['current_price'] = snapshot.latest_trade.price
+                        price_now = float(snapshot.latest_trade.price)
+                        opp['current_price'] = price_now
+                        # Simple filters (no hard symbol excludes)
+                        if price_now < min_trade_price or price_now > max_trade_price:
+                            continue
+                        if float(opp.get('target_move', 0)) < min_target_move_pct:
+                            continue
+                        # Momentum score gate (lets mega-caps through if momentum is strong)
+                        if _momentum_score(opp) < min_momentum_score:
+                            continue
                         opp['validated'] = True
                         validated_opportunities.append(opp)
-                        logger.info(f"✓ Validated: {opp['symbol']} @ ${opp['current_price']:.2f} - {opp['catalyst'][:50]}")
+                        logger.info(f"✓ Validated: {opp['symbol']} @ ${price_now:.2f} - {opp['catalyst'][:50]}")
                 except Exception as e:
                     logger.warning(f"Could not validate {opp.get('symbol', 'Unknown')}: {e}")
             
@@ -1100,33 +1139,72 @@ class GPT5TradingBrain:
                 logger.info(f"Skipping {symbol}: no remaining allocation for {category} bucket")
                 return False
             
-            # Calculate shares
-            current_price = float(self.alpaca.get_latest_trade(symbol).price)
+            # Calculate shares (prefer snapshot over get_latest_trade for reliability)
+            snapshot = None
+            current_price = 0.0
+            try:
+                snapshot = self.alpaca.get_snapshot(symbol, feed='iex')
+                if snapshot and snapshot.latest_trade:
+                    current_price = float(snapshot.latest_trade.price)
+            except Exception:
+                pass
+            if not current_price or current_price <= 0:
+                # Fallback to entry price if provided; else block
+                current_price = float(trade_plan.get('entry_price') or 0)
+            if not current_price or current_price <= 0:
+                logger.warning(f"Could not determine current price for {symbol}; skipping trade")
+                return False
+            
+            # Compute shares from position size and price
             shares = int(position_size / current_price)
             
             if shares < 1:
                 logger.warning(f"Position too small: {symbol}")
                 return False
             
-            # Place order with Alpaca - EXTENDED HOURS ENABLED
-            order = self.alpaca.submit_order(
+            # Decide order params based on market hours
+            is_open = False
+            try:
+                clock = self.alpaca.get_clock()
+                is_open = bool(getattr(clock, 'is_open', False))
+            except Exception:
+                pass
+
+            params = dict(
                 symbol=symbol,
                 qty=shares,
                 side='buy',
-                type='limit',
-                limit_price=trade_plan['entry_price'],
                 time_in_force='day',
-                extended_hours=True,  # Enable extended hours trading
-                order_class='bracket',
-                stop_loss={'stop_price': trade_plan['stop_loss']},
-                take_profit={'limit_price': trade_plan['target_1']}
             )
+
+            # Round prices to 2 decimals for equities
+            entry_price = float(trade_plan.get('entry_price') or current_price)
+            stop_loss = float(trade_plan.get('stop_loss') or 0)
+            take_profit = float(trade_plan.get('target_1') or 0)
+            entry_price = round(entry_price, 2)
+            stop_loss = round(stop_loss, 2) if stop_loss else 0
+            take_profit = round(take_profit, 2) if take_profit else 0
+
+            if is_open:
+                # Use bracket orders only during regular hours; no extended_hours flag
+                if entry_price and entry_price > 0:
+                    params.update(type='limit', limit_price=entry_price)
+                else:
+                    params.update(type='market')
+                if stop_loss and take_profit:
+                    params.update(order_class='bracket', stop_loss={'stop_price': stop_loss}, take_profit={'limit_price': take_profit})
+            else:
+                # Extended hours: limit only, no bracket supported; set extended_hours=True
+                params.update(type='limit', limit_price=entry_price, extended_hours=True)
+
+            logger.info(f"Submitting order for {symbol}: {params}")
+            order = self.alpaca.submit_order(**params)
             
             logger.info(f"✅ GPT-5 executed trade: {symbol}")
             logger.info(f"  Shares: {shares}")
-            logger.info(f"  Entry: ${trade_plan['entry_price']:.2f}")
-            logger.info(f"  Stop: ${trade_plan['stop_loss']:.2f}")
-            logger.info(f"  Target: ${trade_plan['target_1']:.2f}")
+            logger.info(f"  Entry: ${entry_price:.2f}")
+            logger.info(f"  Stop: ${stop_loss:.2f}")
+            logger.info(f"  Target: ${take_profit:.2f}")
             logger.info(f"  Confidence: {trade_plan['confidence']}%")
             logger.info(f"  Category: {category} | Requested%: {requested_pct*100:.1f} | Alloc used: ${position_size:,.2f}")
             logger.info(f"  Reasoning: {trade_plan.get('reasoning', 'N/A')[:200]}")
